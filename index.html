@@ -11607,7 +11607,7 @@ async function pgAdmin(app) {
   const ab = $('#ab'), re = () => pgAdmin(app);
   if (!ab) return;
 
-  if (!ov.keys.gemini && !ov.keys.groq && !ov.keys.openrouter) {
+  if (!ov.keys.gemini && !ov.keys.mistral && !ov.keys.openrouter) {
     ab.insertAdjacentHTML('beforebegin', '<div class="warn" style="margin-bottom:12px">Ключей нейросети нет: матчи идут на запасном генераторе, карточки игроков пустые. Добавьте ключ во вкладке «Настройки».</div>');
   }
 
@@ -16042,7 +16042,7 @@ async function pgAdmin(app) {
             <div>
               <label>URL Cloudflare Worker (прокси)</label>
               <input id="ai_worker_url" value="${e(proxy.workerUrl || '')}" placeholder="https://my-proxy.workers.dev">
-              <div class="small muted" style="margin-top:3px">Запросы к Gemini (/gemini), Groq (/groq), OpenRouter (/openrouter) и Telegram (/telegram) пойдут через этот Worker.</div>
+              <div class="small muted" style="margin-top:3px">Запросы к Gemini (/gemini), Mistral (/mistral), OpenRouter (/openrouter) и Telegram (/telegram) пойдут через этот Worker.</div>
             </div>
           </div>
 
@@ -16095,7 +16095,7 @@ async function pgAdmin(app) {
         <div class="panel">
           <div class="row sp" style="flex-wrap:wrap;gap:8px;margin-bottom:8px">
             <h3 style="margin:0">🔑 Ключи Gemini (${keys.length})</h3>
-            ${mods.groq || mods.openrouter ? `<span class="small muted">Внешний резерв: ${mods.groq ? `Groq (<code>${e(mods.groq)}</code>) ` : ''}${mods.openrouter ? `OpenRouter (<code>${e(mods.openrouter)}</code>)` : ''}</span>` : ''}
+            ${mods.mistral || mods.openrouter ? `<span class="small muted">Цепочка резерва (после 3 ошибок): ${mods.mistral ? `Mistral (<code>${e(mods.mistral)}</code>${mods.mistralUsingFallback ? ' · запасная' : ''}, зап. <code>${e(mods.mistralFallback || 'ministral-8b-latest')}</code>) ` : ''}${mods.openrouter ? `→ OpenRouter (<code>${e(mods.openrouter)}</code>)` : ''}</span>` : ''}
           </div>
           <p class="small muted" style="margin:0 0 12px;line-height:1.45">
             Все запросы равномерно распределяются по ключам (Round-Robin) на выбранной модели <code>${e(curModel)}</code>. При 429 или ошибке ключ уходит на паузу и запрос переходит на следующий ключ. Список ключей редактируется во вкладке «⚙️ Настройки».
@@ -16209,14 +16209,28 @@ async function pgAdmin(app) {
       <div class="row sp" style="flex-wrap:wrap;gap:10px">
         <div>
           <h3 style="margin:0 0 4px;color:#166534">📁 Отдельный файл секретов: secrets.json</h3>
-          <p class="small muted" style="margin:0">Все секретные данные (ключи ИИ Gemini, Groq, OpenRouter, модель, Cloudflare Worker, токен Telegram-бота и ID канала) сохранены в отдельном файле <code>secrets.json</code> в корне проекта. При сохранении этой вкладки файл автоматически обновляется.</p>
+          <p class="small muted" style="margin:0">Все секретные данные (URL базы данных, ключи ИИ Gemini, Mistral AI, OpenRouter, модели, Cloudflare Worker, токен Telegram-бота и ID канала) сохранены в отдельном файле <code>secrets.json</code> в корне проекта. При сохранении этой вкладки файл автоматически обновляется.</p>
         </div>
         <span class="tag" style="background:#dcfce7;color:#166534;border-color:#86efac;font-weight:700">secrets.json активен</span>
       </div>
     </div>
     <div class="panel"><h3>Код администратора</h3><div class="code">${e(s.adminCode)}</div><p class="muted small">Его можно переопределить переменной окружения ADMIN_CODE.</p></div>
-    <div class="panel"><h3>Нейросеть и Cloudflare Worker</h3><p class="muted small">Активная модель Gemini: <code>${e(mo.gemini || 'gemini-4-hydrogen')}</code> → внешний резерв: Groq → OpenRouter. Подробнее во вкладке «🧠 ИИ».</p>
-    ${[['gemini', 'Google Gemini (AI Studio)', 'gemini-4-hydrogen'], ['groq', 'Groq', 'openai/gpt-oss-120b'], ['openrouter', 'OpenRouter', 'openrouter/free']].map(([n, t, d]) => `<div class="row" style="margin-top:8px"><div style="flex:1;min-width:230px">${n === 'gemini' ? `<label>${t} ${k.geminiCount ? '<span class="tag">активных ключей: ' + k.geminiCount + (k.geminiFileCount || k.geminiEnvCount ? ` (secrets.json: ${k.geminiFileCount || 0}, env: ${k.geminiEnvCount || 0})` : '') + (k.geminiCooling ? ' (на паузе: ' + k.geminiCooling + ')' : '') + '</span>' : '<span class="tag" style="background:#fef2f2;color:#991b1b;border-color:#fca5a5">ключей нет</span>'}</label><textarea id="k_gemini" rows="5" style="font:13px/1.4 ui-monospace,Consolas,monospace" autocomplete="off" placeholder="${k.geminiCount ? 'Сейчас: ' + (k.geminiTails || []).join(', ') + '. Вставьте любые ключи (по одному в строке, без ограничений — хоть 50 штук). Пусто — не менять.' : 'Вставьте ключи Gemini, по одному в строке (неограниченно: 10, 20, 50+ штук). Будет работать балансировка Round-Robin.'}"></textarea><div class="muted small" style="margin-top:3px">✨ Поддерживается любое количество ключей Gemini (до 50+). Все ключи используют одну выбранную модель по кругу (Round-Robin).</div>` : `<label>${t} ${k[n] ? '<span class="tag">ключ есть</span>' : ''}</label><input id="k_${n}" type="password" placeholder="${k[n] ? 'оставьте пустым, чтобы не менять' : 'вставьте ключ'}" autocomplete="off">`}</div><div style="flex:1;min-width:200px"><label>Модель</label><input id="m_${n}" value="${e(mo[n] || '')}" placeholder="${d}"></div></div>`).join('')}
+    <div class="panel">
+      <div class="row sp" style="flex-wrap:wrap;gap:8px;margin-bottom:6px">
+        <h3 style="margin:0">🗄 База данных (URL в secrets.json)</h3>
+        ${s.pgActive
+          ? '<span class="tag" style="background:#dcfce7;color:#166534;border-color:#86efac;font-weight:700">PostgreSQL активен</span>'
+          : (s.hasDatabaseUrl
+            ? '<span class="tag" style="background:#fef3c7;color:#92400e;border-color:#fde68a;font-weight:700">PostgreSQL недоступен · локальный data/db.json</span>'
+            : '<span class="tag">Локальный файл data/db.json</span>')}
+      </div>
+      <label>PostgreSQL / Neon URL (<code>databaseUrl</code> в <code>secrets.json</code>)</label>
+      <input id="s_database_url" type="password" value="" autocomplete="off" placeholder="${s.hasDatabaseUrl ? e(s.databaseUrlMasked || '••••••') + ' (задан, пусто — не менять)' : 'postgresql://user:password@host/db?sslmode=require'}">
+      ${s.hasDatabaseUrl ? `<label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;margin-top:6px;font-size:12px"><input type="checkbox" id="s_clear_database_url" style="width:auto"> Очистить URL базы данных (перейти на локальный data/db.json)</label>` : ''}
+      <div class="small muted" style="margin-top:4px">Хранится локально в <code>secrets.json</code>. При изменении URL потребуется перезапуск сервера.</div>
+    </div>
+    <div class="panel"><h3>Нейросеть и Cloudflare Worker</h3><p class="muted small">Цепочка резерва: Gemini (<code>${e(mo.gemini || 'gemini-4-hydrogen')}</code>, после 3 ошибок всех ключей) → Mistral AI (<code>${e(mo.mistral || 'ministral-14b-latest')}</code>, после 3 ошибок → <code>${e(mo.mistralFallback || 'ministral-8b-latest')}</code>) → OpenRouter (<code>${e(mo.openrouter || 'openrouter/free')}</code>). Подробнее во вкладке «🧠 ИИ».</p>
+    ${[['gemini', 'Google Gemini (AI Studio)', 'gemini-4-hydrogen'], ['mistral', 'Mistral AI', 'ministral-14b-latest'], ['openrouter', 'OpenRouter', 'openrouter/free']].map(([n, t, d]) => `<div class="row" style="margin-top:8px;align-items:flex-start"><div style="flex:1;min-width:230px">${n === 'gemini' ? `<label>${t} ${k.geminiCount ? '<span class="tag">активных ключей: ' + k.geminiCount + (k.geminiFileCount || k.geminiEnvCount ? ` (secrets.json: ${k.geminiFileCount || 0}, env: ${k.geminiEnvCount || 0})` : '') + (k.geminiCooling ? ' (на паузе: ' + k.geminiCooling + ')' : '') + '</span>' : '<span class="tag" style="background:#fef2f2;color:#991b1b;border-color:#fca5a5">ключей нет</span>'}</label><textarea id="k_gemini" rows="5" style="font:13px/1.4 ui-monospace,Consolas,monospace" autocomplete="off" placeholder="${k.geminiCount ? 'Сейчас: ' + (k.geminiTails || []).join(', ') + '. Вставьте любые ключи (по одному в строке, без ограничений — хоть 50 штук). Пусто — не менять.' : 'Вставьте ключи Gemini, по одному в строке (неограниченно: 10, 20, 50+ штук). Будет работать балансировка Round-Robin.'}"></textarea><div class="muted small" style="margin-top:3px">✨ Поддерживается любое количество ключей Gemini (до 50+). Все ключи используют одну выбранную модель по кругу (Round-Robin).</div>` : `<label>${t} ${k[n] ? '<span class="tag">ключ есть</span>' : ''}</label><input id="k_${n}" type="password" placeholder="${k[n] ? 'оставьте пустым, чтобы не менять' : 'вставьте ключ'}" autocomplete="off">`}</div><div style="flex:1;min-width:200px"><label>${n === 'mistral' ? 'Основная модель Mistral' : 'Модель'}</label><input id="m_${n}" value="${e(mo[n] || '')}" placeholder="${d}">${n === 'mistral' ? `<label style="margin-top:8px">Запасная модель (после 3 ошибок)</label><input id="m_mistralFallback" value="${e(mo.mistralFallback || 'ministral-8b-latest')}" placeholder="ministral-8b-latest">` : ''}</div></div>`).join('')}
     <div class="row" style="margin-top:10px"><div style="flex:1;min-width:230px"><label>URL Cloudflare Worker (прокси)</label><input id="s_worker_url" value="${e(s.workerUrl || '')}" placeholder="https://my-proxy.workers.dev"></div><div style="flex:1;min-width:200px"><label>PROXY_SECRET</label><input id="s_worker_secret" type="password" value="" autocomplete="off" placeholder="${s.hasWorkerSecret ? '•••••• (задан, пусто — не менять)' : 'вставьте PROXY_SECRET'}"></div></div>
     <label style="margin-top:10px"><input type="checkbox" id="gr" ${s.grounding ? 'checked' : ''} style="width:auto"> Поиск Google при создании карточек (только Gemini)</label></div>
     <div class="panel"><h3>Трансляция и Telegram</h3><div class="row"><div style="flex:1;min-width:200px"><label>Секунд реального времени на минуту матча</label><input id="spm" type="number" step="0.5" value="${s.secPerMin}"></div><div style="flex:1;min-width:200px"><label>Пауза на перерыве, сек</label><input id="brk" type="number" value="${s.breakSec}"></div></div>
@@ -16282,12 +16296,14 @@ async function pgAdmin(app) {
 
     $('#ssv').onclick = async () => {
       const keys = {}, models = {};
-      for (const n of ['gemini', 'groq', 'openrouter']) {
+      for (const n of ['gemini', 'mistral', 'openrouter']) {
         keys[n] = $('#k_' + n).value;
         models[n] = $('#m_' + n).value;
         if (!keys[n]) delete keys[n];
       }
-      await act(() => api('/admin/settings', { keys, models, workerUrl: $('#s_worker_url').value.trim(), workerSecret: $('#s_worker_secret').value, grounding: $('#gr').checked, secPerMin: $('#spm').value, breakSec: $('#brk').value, tgToken: $('#tgt').value, tgChat: $('#tgc').value, siteUrl: $('#url').value, squadMax: $('#sqm').value, chunks: $('#chk').value, auto: $('#auto').checked, techDefeat: $('#tdef').checked, systemPrompt: $('#sys').value }), 'Настройки сохранены');
+      if ($('#m_mistralFallback')) models.mistralFallback = $('#m_mistralFallback').value;
+      const clearDbEl = $('#s_clear_database_url');
+      await act(() => api('/admin/settings', { keys, models, databaseUrl: $('#s_database_url')?.value || '', clearDatabaseUrl: !!(clearDbEl && clearDbEl.checked), workerUrl: $('#s_worker_url').value.trim(), workerSecret: $('#s_worker_secret').value, grounding: $('#gr').checked, secPerMin: $('#spm').value, breakSec: $('#brk').value, tgToken: $('#tgt').value, tgChat: $('#tgc').value, siteUrl: $('#url').value, squadMax: $('#sqm').value, chunks: $('#chk').value, auto: $('#auto').checked, techDefeat: $('#tdef').checked, systemPrompt: $('#sys').value }), 'Настройки сохранены');
       re();
     };
   }

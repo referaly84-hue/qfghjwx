@@ -14,6 +14,8 @@ import {
   pickRealisticFoulLine
 } from "./src/broadcast_engine.ts";
 const DEFAULT_GEMINI_PRIMARY_MODEL = "gemini-4-hydrogen";
+const DEFAULT_MISTRAL_PRIMARY_MODEL = "ministral-14b-latest";
+const DEFAULT_MISTRAL_FALLBACK_MODEL = "ministral-8b-latest";
 const GEMINI_PRESET_MODELS = [
   "gemini-4-hydrogen",
   "gemini-3.6-flash",
@@ -1592,8 +1594,18 @@ var DICTS = [
   { key: "cityClimates", table: "city_climates" }
 ];
 var HANDLED = /* @__PURE__ */ new Set([...ARRAYS.map((a) => a.key), ...DICTS.map((d) => d.key), "settings", "sessions", "_savedAt", "insiderPosts", "eskCases", "aiHistory"]);
+function readDbUrlFromSecrets() {
+  try {
+    const f = path3.resolve("secrets.json");
+    if (!fs3.existsSync(f)) return "";
+    const sec = JSON.parse(fs3.readFileSync(f, "utf8"));
+    return String(sec?.databaseUrl || sec?.postgresUrl || sec?.dbUrl || "").trim();
+  } catch {
+    return "";
+  }
+}
 function connConfig() {
-  const raw = String(process.env.DATABASE_URL || process.env.POSTGRES_URL || PG_HARDCODED.url || "").trim();
+  const raw = String(readDbUrlFromSecrets() || process.env.DATABASE_URL || process.env.POSTGRES_URL || PG_HARDCODED.url || "").trim();
   if (!raw) return null;
   let cs = raw;
   let ssl = false;
@@ -5446,14 +5458,14 @@ function respondToForeignOffer(db2: any, offerId: string, action: string, tid?: 
 var _origFetch = globalThis.fetch;
 var PROXY_ROUTES = [
   ["https://generativelanguage.googleapis.com", "/gemini"],
-  ["https://api.groq.com", "/groq"],
+  ["https://api.mistral.ai", "/mistral"],
   ["https://openrouter.ai", "/openrouter"],
   ["https://api.telegram.org", "/telegram"]
 ];
 function normalizeWorkerUrl(rawUrl) {
   try {
     let u = String(rawUrl || "").trim().replace(/\/+$/, "");
-    u = u.replace(/\/+(?:gemini|groq|openrouter|telegram)$/i, "").replace(/\/+$/, "");
+    u = u.replace(/\/+(?:gemini|mistral|openrouter|telegram)$/i, "").replace(/\/+$/, "");
     return u;
   } catch {
     return "";
@@ -5519,7 +5531,10 @@ function readSecretsFile() {
 function saveSecretsFile(updates) {
   try {
     const cur = readSecretsFile();
-    const merged = { ...cur, ...updates };
+    const merged: Record<string, any> = { ...cur, ...updates };
+    delete merged.groqKeys;
+    delete merged.groqKey;
+    delete merged.groqModel;
     fs3.writeFileSync(SECRETS_FILE, JSON.stringify(merged, null, 2), "utf8");
     try {
       lastSecretsMtimeMs = fs3.statSync(SECRETS_FILE).mtimeMs;
@@ -5543,6 +5558,18 @@ function secList(...vals) {
   }
   return out;
 }
+function maskDatabaseUrl(rawUrl: string): string {
+  const s = String(rawUrl || "").trim();
+  if (!s) return "";
+  try {
+    const u = new URL(s);
+    const hasAuth = !!(u.username || u.password);
+    const authPart = hasAuth ? "\u2022\u2022\u2022:\u2022\u2022\u2022@" : "";
+    return `${u.protocol}//${authPart}${u.host}${u.pathname}`;
+  } catch {
+    return "\u2022\u2022\u2022\u2022\u2022\u2022";
+  }
+}
 function syncSecretsFromDisk(force = false) {
   try {
     if (!fs3.existsSync(SECRETS_FILE)) return false;
@@ -5550,7 +5577,8 @@ function syncSecretsFromDisk(force = false) {
     if (!force && st.mtimeMs === lastSecretsMtimeMs) return false;
     lastSecretsMtimeMs = st.mtimeMs;
     const sec = readSecretsFile();
-    if (typeof keyCooldown !== "undefined" && keyCooldown) keyCooldown.clear();
+    if (typeof resetAllAiFailoverState === "function") resetAllAiFailoverState();
+    else if (typeof keyCooldown !== "undefined" && keyCooldown) keyCooldown.clear();
     if (!db || !db.settings) return true;
     let changed = false;
     if (!db.settings.keys) db.settings.keys = {};
@@ -5579,13 +5607,15 @@ function syncSecretsFromDisk(force = false) {
 }
 var HARDCODED = {
   get geminiKeys() { const s = readSecretsFile(); return secList(s.geminiKeys, s.geminiKey); },
-  get groqKeys() { const s = readSecretsFile(); return secList(s.groqKeys, s.groqKey); },
+  get mistralKeys() { const s = readSecretsFile(); return secList(s.mistralKeys, s.mistralKey); },
   get openrouterKeys() { const s = readSecretsFile(); return secList(s.openrouterKeys, s.openrouterKey); },
-  get groqKey() { return this.groqKeys[0] || ""; },
+  get mistralKey() { return this.mistralKeys[0] || ""; },
   get openrouterKey() { return this.openrouterKeys[0] || ""; },
   get geminiModel() { return resolveGeminiModel(readSecretsFile().geminiModel || process.env.GEMINI_MODEL || DEFAULT_GEMINI_PRIMARY_MODEL); },
-  get groqModel() { return String(readSecretsFile().groqModel || process.env.GROQ_MODEL || "openai/gpt-oss-120b").trim(); },
+  get mistralModel() { return String(readSecretsFile().mistralModel || process.env.MISTRAL_MODEL || DEFAULT_MISTRAL_PRIMARY_MODEL).trim() || DEFAULT_MISTRAL_PRIMARY_MODEL; },
+  get mistralFallbackModel() { return String(readSecretsFile().mistralFallbackModel || process.env.MISTRAL_FALLBACK_MODEL || DEFAULT_MISTRAL_FALLBACK_MODEL).trim() || DEFAULT_MISTRAL_FALLBACK_MODEL; },
   get openrouterModel() { return String(readSecretsFile().openrouterModel || process.env.OPENROUTER_MODEL || "openrouter/free").trim(); },
+  get databaseUrl() { const s = readSecretsFile(); return String(s.databaseUrl || s.postgresUrl || s.dbUrl || process.env.DATABASE_URL || process.env.POSTGRES_URL || "").trim(); },
   get tgToken() { const t = String(readSecretsFile().tgToken || "").trim(); return t.includes("\u2022") ? "" : t; },
   get tgChat() { return String(readSecretsFile().tgChat || "").trim(); },
   get adminCode() { return readSecretsFile().adminCode || ""; },
@@ -5595,7 +5625,7 @@ var HARDCODED = {
 var HARDCODED_LEGACY = {
   geminiKeys: [],
   geminiModel: DEFAULT_GEMINI_PRIMARY_MODEL,
-  groqKey: "",
+  mistralKey: "",
   openrouterKey: "",
   tgToken: "",
   tgChat: ""
@@ -8933,14 +8963,22 @@ function provList() {
   syncSecretsFromDisk();
   const L = [];
   const gKeys = getGeminiKeys();
-  const qKeys = secList(HARDCODED.groqKeys, process.env.GROQ_API_KEY);
+  const mKeys = secList(HARDCODED.mistralKeys, process.env.MISTRAL_API_KEY);
   const oKeys = secList(HARDCODED.openrouterKeys, process.env.OPENROUTER_API_KEY);
   const gModel = getGeminiModel();
   for (let i = 0; i < gKeys.length; i++) {
     L.push({ n: "gemini", id: `gemini_proj_${i + 1}`, key: gKeys[i], model: gModel, max: 32e3 });
   }
-  for (let i = 0; i < qKeys.length; i++) {
-    L.push({ n: "groq", id: `groq_${i + 1}`, key: qKeys[i], base: "https://api.groq.com/openai/v1", model: HARDCODED.groqModel, max: 8e3 });
+  for (let i = 0; i < mKeys.length; i++) {
+    L.push({
+      n: "mistral",
+      id: `mistral_${i + 1}`,
+      key: mKeys[i],
+      base: "https://api.mistral.ai/v1",
+      model: HARDCODED.mistralModel || DEFAULT_MISTRAL_PRIMARY_MODEL,
+      fallbackModel: HARDCODED.mistralFallbackModel || DEFAULT_MISTRAL_FALLBACK_MODEL,
+      max: 16e3
+    });
   }
   for (let i = 0; i < oKeys.length; i++) {
     L.push({ n: "openrouter", id: `openrouter_${i + 1}`, key: oKeys[i], base: "https://openrouter.ai/api/v1", model: HARDCODED.openrouterModel, max: 8e3 });
@@ -9343,7 +9381,20 @@ async function callProv(p, sys, user, o) {
         throw err;
       }
     }
-    const body: any = { model: p.model, messages: [{ role: "system", content: sys }, { role: "user", content: user }], temperature: o.temp, max_tokens: Math.min(o.max, p.max) };
+    const messages: any[] = [];
+    let sysTxt = sys && String(sys).trim() ? String(sys) : "";
+    const userTxt = String(user || "");
+    if (o.json && !/json/i.test(`${sysTxt}\n${userTxt}`)) {
+      sysTxt = sysTxt ? `${sysTxt}\nОтвечай строго в формате JSON.` : "Отвечай строго в формате JSON.";
+    }
+    if (sysTxt) messages.push({ role: "system", content: sysTxt });
+    messages.push({ role: "user", content: userTxt });
+    const body: any = {
+      model: p.model,
+      messages,
+      temperature: o.temp ?? 0.7,
+      max_tokens: Math.max(64, Math.min(Math.round(Number(o.max || 8000)), p.max || 8000))
+    };
     if (o.json) body.response_format = { type: "json_object" };
     const r = await fetch(p.base + "/chat/completions", {
       method: "POST",
@@ -9361,7 +9412,12 @@ async function callProv(p, sys, user, o) {
         totalTokens: Number(j.usage.total_tokens || 0)
       };
     }
-    return j.choices?.[0]?.message?.content || "";
+    const rawContent = j.choices?.[0]?.message?.content;
+    if (typeof rawContent === "string") return rawContent;
+    if (Array.isArray(rawContent)) {
+      return rawContent.map((part: any) => typeof part === "string" ? part : (part?.text || "")).join("");
+    }
+    return "";
   } finally {
     clearTimeout(to);
   }
@@ -9397,6 +9453,106 @@ var keyCooldown = /* @__PURE__ */ new Map();
 var modelErrorStreak = /* @__PURE__ */ new Map<string, { streak: number; lastFailAt: number; lastOkAt: number; lastErr: string }>();
 var stickyFallbackModel: { model: string; until: number; replacedModel: string } | null = null;
 var geminiRoundRobinIndex = 0;
+var mistralRoundRobinIndex = 0;
+const GEMINI_CIRCUIT_WINDOW_MS = 5 * 60 * 1000;
+const MISTRAL_FALLBACK_WINDOW_MS = 15 * 60 * 1000;
+const MISTRAL_CIRCUIT_WINDOW_MS = 5 * 60 * 1000;
+var geminiFailStreak = 0;
+var geminiLastFailAt = 0;
+var mistralPrimaryFailStreak = 0;
+var mistralPrimaryLastFailAt = 0;
+var mistralFallbackUntil = 0;
+var mistralFallbackFailStreak = 0;
+var mistralFallbackLastFailAt = 0;
+var mistralSkipUntil = 0;
+function isGeminiCircuitOpen(now = Date.now()): boolean {
+  if (geminiFailStreak >= 3 && (now - geminiLastFailAt < GEMINI_CIRCUIT_WINDOW_MS)) {
+    return true;
+  }
+  if (geminiFailStreak > 0 && (now - geminiLastFailAt >= GEMINI_CIRCUIT_WINDOW_MS)) {
+    geminiFailStreak = 0;
+  }
+  return false;
+}
+function recordGeminiSuccess() {
+  geminiFailStreak = 0;
+  geminiLastFailAt = 0;
+}
+function recordGeminiFailure(now = Date.now()) {
+  if (now - geminiLastFailAt >= GEMINI_CIRCUIT_WINDOW_MS) {
+    geminiFailStreak = 0;
+  }
+  geminiFailStreak++;
+  geminiLastFailAt = now;
+}
+function isMistralUsingFallback(now = Date.now()): boolean {
+  if (mistralFallbackUntil > now) return true;
+  if (mistralFallbackUntil && mistralFallbackUntil <= now) {
+    mistralFallbackUntil = 0;
+    mistralPrimaryFailStreak = 0;
+  }
+  return false;
+}
+function getEffectiveMistralModel(now = Date.now()): string {
+  const primary = HARDCODED.mistralModel || DEFAULT_MISTRAL_PRIMARY_MODEL;
+  const fallback = HARDCODED.mistralFallbackModel || DEFAULT_MISTRAL_FALLBACK_MODEL;
+  if (fallback && fallback !== primary && isMistralUsingFallback(now)) {
+    return fallback;
+  }
+  return primary;
+}
+function recordMistralOutcome(model: string, ok: boolean, now = Date.now()) {
+  const primary = HARDCODED.mistralModel || DEFAULT_MISTRAL_PRIMARY_MODEL;
+  const fallback = HARDCODED.mistralFallbackModel || DEFAULT_MISTRAL_FALLBACK_MODEL;
+  if (ok) {
+    mistralSkipUntil = 0;
+    if (model === primary) {
+      mistralPrimaryFailStreak = 0;
+      mistralPrimaryLastFailAt = 0;
+      mistralFallbackUntil = 0;
+    } else if (model === fallback) {
+      mistralFallbackFailStreak = 0;
+      mistralFallbackLastFailAt = 0;
+    }
+    return;
+  }
+  if (model === primary) {
+    if (now - mistralPrimaryLastFailAt >= MISTRAL_FALLBACK_WINDOW_MS) {
+      mistralPrimaryFailStreak = 0;
+    }
+    mistralPrimaryFailStreak++;
+    mistralPrimaryLastFailAt = now;
+    if (mistralPrimaryFailStreak >= 3 && fallback && fallback !== primary) {
+      mistralFallbackUntil = now + MISTRAL_FALLBACK_WINDOW_MS;
+      mistralFallbackFailStreak = 0;
+    }
+    if ((!fallback || fallback === primary) && mistralPrimaryFailStreak >= 3) {
+      mistralSkipUntil = now + MISTRAL_CIRCUIT_WINDOW_MS;
+    }
+  } else {
+    if (now - mistralFallbackLastFailAt >= MISTRAL_CIRCUIT_WINDOW_MS) {
+      mistralFallbackFailStreak = 0;
+    }
+    mistralFallbackFailStreak++;
+    mistralFallbackLastFailAt = now;
+    if (mistralFallbackFailStreak >= 3) {
+      mistralSkipUntil = now + MISTRAL_CIRCUIT_WINDOW_MS;
+    }
+  }
+}
+function resetAllAiFailoverState() {
+  keyCooldown.clear();
+  modelErrorStreak.clear();
+  stickyFallbackModel = null;
+  geminiFailStreak = 0;
+  geminiLastFailAt = 0;
+  mistralPrimaryFailStreak = 0;
+  mistralPrimaryLastFailAt = 0;
+  mistralFallbackUntil = 0;
+  mistralFallbackFailStreak = 0;
+  mistralFallbackLastFailAt = 0;
+  mistralSkipUntil = 0;
+}
 function getEffectiveGeminiModel(now = Date.now()): string {
   const primary = getGeminiModel();
   if (stickyFallbackModel && stickyFallbackModel.until > now && stickyFallbackModel.replacedModel === primary) {
@@ -9535,8 +9691,10 @@ function areAllProvidersAuthBlocked(now = Date.now()): boolean {
   const all = provList();
   if (!all.length) return false;
   const gModel = getEffectiveGeminiModel(now);
+  const mModel = getEffectiveMistralModel(now);
   for (const p of all) {
-    const kc = getCooldownEntry(p.key, p.n === "gemini" ? gModel : p.model, now);
+    const model = p.n === "gemini" ? gModel : (p.n === "mistral" ? mModel : p.model);
+    const kc = getCooldownEntry(p.key, model, now);
     if (!kc || !kc.authInvalid) return false;
   }
   return true;
@@ -9566,45 +9724,195 @@ async function llm(sys, user, { json = true, task = "", temp = 0.9, max = 16e3, 
     if (da !== dbScore) return da - dbScore;
     return rawChain.indexOf(a) - rawChain.indexOf(b);
   });
+
   const geminiProvsRaw = all.filter((p) => p.n === "gemini");
-  const otherProvs = all.filter((p) => p.n !== "gemini");
   let gProvs = geminiProvsRaw;
   if (gProvs.length > 1) {
     geminiRoundRobinIndex = (geminiRoundRobinIndex + 1) % gProvs.length;
     gProvs = [...gProvs.slice(geminiRoundRobinIndex), ...gProvs.slice(0, geminiRoundRobinIndex)];
   }
+  const mistralProvsRaw = all.filter((p) => p.n === "mistral");
+  let mProvs = mistralProvsRaw;
+  if (mProvs.length > 1) {
+    mistralRoundRobinIndex = (mistralRoundRobinIndex + 1) % mProvs.length;
+    mProvs = [...mProvs.slice(mistralRoundRobinIndex), ...mProvs.slice(0, mistralRoundRobinIndex)];
+  }
+  const oProvs = all.filter((p) => p.n === "openrouter");
 
-  const attempts: Array<{ p: any; model: string; grounded: boolean; fallbackCooled?: boolean }> = [];
+  const runProviderAttempt = async (p: any, model: string, useGrounded: boolean) => {
+    const provRun = { ...p, model };
+    const keyTail = "\u2026" + String(p.key || "").slice(-4);
+    const t0 = Date.now();
+    let rawText = "";
+    const callOpts: any = { json, temp, max, grounded: useGrounded };
+    try {
+      const text = await callProv(provRun, sys, user, callOpts);
+      rawText = String(text || "");
+      if (!rawText.trim()) throw Object.assign(new Error("\u043F\u0443\u0441\u0442\u043E\u0439 \u043E\u0442\u0432\u0435\u0442"), { badJson: true });
+      if (json) {
+        try {
+          parseJSON(rawText);
+        } catch (je: any) {
+          throw Object.assign(new Error(je?.message || "\u043D\u0435\u0439\u0440\u043E\u0441\u0435\u0442\u044C \u0432\u0435\u0440\u043D\u0443\u043B\u0430 \u043D\u0435-JSON"), { badJson: true });
+        }
+      }
+      const elapsed = Date.now() - t0;
+      const usage = callOpts._lastUsage || {};
+      clearKeyCooldown(p.key, model);
+      if (p.n === "gemini") {
+        recordGeminiSuccess();
+        recordModelSuccess(model);
+        recordAiKeyAttempt(p.key, model, { ok: true, ms: elapsed, usage });
+      } else if (p.n === "mistral") {
+        recordMistralOutcome(model, true);
+      }
+      llog({ task, p: provRun.id || provRun.n, model: provRun.model, ok: 1, ms: elapsed, tokens: usage.totalTokens || 0 });
+      recordAiHistory({ task, provider: provRun.n, model: provRun.model, keyTail, tokens: usage.totalTokens || 0, user, sys, ok: 1, ms: elapsed, response: rawText });
+      return { ok: true as const, text: rawText };
+    } catch (e: any) {
+      const elapsed = Date.now() - t0;
+      if (p.n === "gemini") {
+        recordAiKeyAttempt(p.key, model, { ok: false, ms: elapsed, errMsg: e?.message || String(e), status: e?.status || 0 });
+      }
+      llog({ task, p: provRun.id || provRun.n, model: provRun.model, ok: 0, ms: elapsed, err: String(e.message || e).slice(0, 160) });
+      recordAiHistory({ task, provider: provRun.n, model: provRun.model, keyTail, user, sys, ok: 0, ms: elapsed, response: rawText, err: e.message || String(e) });
+      return { ok: false as const, err: e };
+    }
+  };
+
+  let last: any = null;
+  let hadAnyAttempt = false;
   const cooledFallback: Array<{ p: any; model: string; grounded: boolean; until: number }> = [];
 
-  for (const modelCandidate of modelChain) {
-    for (const p of gProvs) {
-      const kc = getCooldownEntry(p.key, modelCandidate, now);
-      if (kc) {
-        if (!kc.authInvalid && !kc.daily && !kc.notFound) {
-          cooledFallback.push({ p, model: modelCandidate, grounded: !!grounded, until: getCooldownUntil(kc) });
+  // ───────── ЭТАП 1: GEMINI (до 3 ошибок по всем ключам → затем Mistral) ─────────
+  if (gProvs.length && !isGeminiCircuitOpen(now)) {
+    const geminiAttempts: Array<{ p: any; model: string; grounded: boolean }> = [];
+    for (const modelCandidate of modelChain) {
+      for (const p of gProvs) {
+        const kc = getCooldownEntry(p.key, modelCandidate, now);
+        if (kc) {
+          if (!kc.authInvalid && !kc.daily && !kc.notFound) {
+            cooledFallback.push({ p, model: modelCandidate, grounded: !!grounded, until: getCooldownUntil(kc) });
+          }
+          continue;
         }
+        geminiAttempts.push({ p, model: modelCandidate, grounded: !!grounded });
+      }
+    }
+
+    let geminiErrorsInCall = 0;
+    for (const att of geminiAttempts) {
+      if (geminiErrorsInCall >= 3 || isGeminiCircuitOpen(Date.now())) break;
+      if (getCooldownEntry(att.p.key, att.model)) continue;
+
+      hadAnyAttempt = true;
+      const res1 = await runProviderAttempt(att.p, att.model, att.grounded);
+      if (res1.ok) return res1.text;
+
+      let errObj = res1.err;
+      if (att.grounded && errObj.status !== 401 && errObj.status !== 403 && errObj.status !== 429 && errObj.status !== 404) {
+        const res2 = await runProviderAttempt(att.p, att.model, false);
+        if (res2.ok) return res2.text;
+        errObj = res2.err;
+      }
+
+      last = errObj;
+      geminiErrorsInCall++;
+      recordGeminiFailure();
+      if (errObj.authInvalid || errObj.status === 401 || errObj.status === 403 || errObj.status === 429 || errObj.status === 404 || errObj.status >= 500 || errObj.name === "AbortError" || errObj.networkError) {
+        coolKey(att.p, errObj, att.model);
+      }
+      if (geminiErrorsInCall < 3 && !isGeminiCircuitOpen(Date.now())) {
+        await sleep(errObj.badJson ? 80 : 120);
+      }
+    }
+  }
+
+  // ───────── ЭТАП 2: MISTRAL AI (ministral-14b-latest → после 3 ошибок → ministral-8b-latest → после 3 ошибок → OpenRouter) ─────────
+  const tryMistralModel = async (targetModel: string, maxFailures: number) => {
+    if (!mProvs.length || !targetModel) return null;
+    let errorsOnModel = 0;
+    let cursor = 0;
+    while (errorsOnModel < maxFailures) {
+      const avail = mProvs.filter((p) => !getCooldownEntry(p.key, "__AUTH__", Date.now()) && !getCooldownEntry(p.key, targetModel, Date.now()));
+      if (!avail.length) break;
+      const p = avail[cursor % avail.length];
+      cursor++;
+
+      hadAnyAttempt = true;
+      const res = await runProviderAttempt(p, targetModel, false);
+      if (res.ok) return res.text;
+
+      const errObj = res.err;
+      last = errObj;
+      errorsOnModel++;
+      recordMistralOutcome(targetModel, false);
+
+      const isAuth = !!(errObj.authInvalid || errObj.status === 401 || errObj.status === 403);
+      if (isAuth) {
+        coolKey(p, errObj, targetModel);
         continue;
       }
-      attempts.push({ p, model: modelCandidate, grounded: !!grounded });
+      if (errorsOnModel >= maxFailures || (targetModel === (HARDCODED.mistralModel || DEFAULT_MISTRAL_PRIMARY_MODEL) && isMistralUsingFallback(Date.now())) || mistralSkipUntil > Date.now()) {
+        if (errObj.status === 429 || errObj.status === 404 || errObj.status >= 500 || errObj.name === "AbortError" || errObj.networkError) {
+          coolKey(p, errObj, targetModel);
+        }
+        break;
+      }
+      await sleep(errObj.badJson ? 80 : 150);
+    }
+    return null;
+  };
+
+  if (mProvs.length && !(mistralSkipUntil > Date.now())) {
+    const mPrimary = HARDCODED.mistralModel || DEFAULT_MISTRAL_PRIMARY_MODEL;
+    const mFallback = HARDCODED.mistralFallbackModel || DEFAULT_MISTRAL_FALLBACK_MODEL;
+
+    if (!isMistralUsingFallback(Date.now())) {
+      const primaryText = await tryMistralModel(mPrimary, 3);
+      if (primaryText !== null) return primaryText;
+    }
+
+    if (mFallback && mFallback !== mPrimary && isMistralUsingFallback(Date.now()) && !(mistralSkipUntil > Date.now())) {
+      const fallbackText = await tryMistralModel(mFallback, 3);
+      if (fallbackText !== null) return fallbackText;
     }
   }
-  for (const p of otherProvs) {
-    if (!getCooldownEntry(p.key, p.model, now)) {
-      attempts.push({ p, model: p.model, grounded: false });
+
+  // ───────── ЭТАП 3: OPENROUTER ─────────
+  for (const p of oProvs) {
+    if (getCooldownEntry(p.key, p.model, Date.now())) continue;
+    hadAnyAttempt = true;
+    const res = await runProviderAttempt(p, p.model, false);
+    if (res.ok) return res.text;
+
+    const errObj = res.err;
+    last = errObj;
+    if (errObj.authInvalid || errObj.status === 401 || errObj.status === 403 || errObj.status === 429 || errObj.status === 404 || errObj.status >= 500 || errObj.name === "AbortError" || errObj.networkError) {
+      coolKey(p, errObj, p.model);
     }
+    await sleep(errObj.badJson ? 80 : 120);
   }
-  if (!attempts.length && cooledFallback.length) {
+
+  // ───────── АВАРИЙНАЯ ПОПЫТКА ПО ИСТЕЧЕНИИ ПАУЗЫ ЕСЛИ ВСЕ ПРОВАЙДЕРЫ НА ПАУЗЕ ─────────
+  if (!hadAnyAttempt && cooledFallback.length) {
     cooledFallback.sort((a, b) => a.until - b.until);
-    for (const cf of cooledFallback.slice(0, 1)) {
-      attempts.push({ p: cf.p, model: cf.model, grounded: cf.grounded, fallbackCooled: true });
+    const cf = cooledFallback[0];
+    hadAnyAttempt = true;
+    const res = await runProviderAttempt(cf.p, cf.model, cf.grounded);
+    if (res.ok) return res.text;
+    last = res.err;
+    if (last.authInvalid || last.status === 401 || last.status === 403 || last.status === 429 || last.status === 404 || last.status >= 500 || last.name === "AbortError" || last.networkError) {
+      coolKey(cf.p, last, cf.model);
     }
   }
-  if (!attempts.length) {
+
+  if (!hadAnyAttempt) {
     cx.calls = Math.max(0, cx.calls - 1);
     const activeCooldowns = [
       ...gProvs.map((p) => getCooldownEntry(p.key, effectiveModel, now)),
-      ...otherProvs.map((p) => getCooldownEntry(p.key, p.model, now))
+      ...mProvs.map((p) => getCooldownEntry(p.key, getEffectiveMistralModel(now), now)),
+      ...oProvs.map((p) => getCooldownEntry(p.key, p.model, now))
     ].filter(Boolean);
     const hasQuotaCooldown = activeCooldowns.some((kc: any) => kc?.daily || kc?.status === 429);
     const hasAuthCooldown = activeCooldowns.some((kc: any) => kc?.authInvalid);
@@ -9618,82 +9926,22 @@ async function llm(sys, user, { json = true, task = "", temp = 0.9, max = 16e3, 
         );
       }
       throw Object.assign(
-        new Error("Все доступные API-ключи ИИ отклонены (401/403 PERMISSION_DENIED). Проверьте GEMINI_API_KEY в Settings > Secrets или в настройках администратора."),
+        new Error("Все доступные API-ключи ИИ отклонены (401/403 PERMISSION_DENIED). Проверьте ключи в secrets.json или в настройках администратора."),
         { status: 403, authInvalid: true }
       );
     }
     if (!hasQuotaCooldown && hasNotFoundCooldown) {
       throw Object.assign(
-        new Error("Выбранная модель Gemini не найдена (404 NOT_FOUND). Выберите актуальную модель в настройках ИИ."),
+        new Error("Выбранная модель ИИ не найдена (404 NOT_FOUND). Выберите актуальную модель в настройках ИИ."),
         { status: 404 }
       );
     }
     throw Object.assign(
-      new Error("Квота всех доступных моделей ИИ исчерпана (429 RESOURCE_EXHAUSTED). Подождите сброса лимита, переключите модель в настройках или используйте платный API-ключ."),
+      new Error("Квота всех доступных моделей ИИ исчерпана (429 RESOURCE_EXHAUSTED). Подождите сброса лимита, переключите модель в настройках или используйте другой ключ."),
       { status: 429, daily: true, quotaExhausted: true }
     );
   }
 
-  let last: any;
-  for (const att of attempts) {
-    const p = att.p;
-    if (!att.fallbackCooled && getCooldownEntry(p.key, att.model)) {
-      continue;
-    }
-    const provRun = p.n === "gemini" ? { ...p, model: att.model } : p;
-    const keyTail = p.n === "gemini" ? "\u2026" + String(p.key || "").slice(-4) : "";
-    const runAttempt = async (useGrounded: boolean) => {
-      const t0 = Date.now();
-      let rawText = "";
-      const callOpts: any = { json, temp, max, grounded: useGrounded };
-      try {
-        const text = await callProv(provRun, sys, user, callOpts);
-        rawText = String(text || "");
-        if (!rawText.trim()) throw Object.assign(new Error("\u043F\u0443\u0441\u0442\u043E\u0439 \u043E\u0442\u0432\u0435\u0442"), { badJson: true });
-        if (json) {
-          try {
-            parseJSON(rawText);
-          } catch (je: any) {
-            throw Object.assign(new Error(je?.message || "\u043D\u0435\u0439\u0440\u043E\u0441\u0435\u0442\u044C \u0432\u0435\u0440\u043D\u0443\u043B\u0430 \u043D\u0435-JSON"), { badJson: true });
-          }
-        }
-        const elapsed = Date.now() - t0;
-        const usage = callOpts._lastUsage || {};
-        clearKeyCooldown(p.key, att.model);
-        if (p.n === "gemini") {
-          recordModelSuccess(att.model);
-          recordAiKeyAttempt(p.key, att.model, { ok: true, ms: elapsed, usage });
-        }
-        llog({ task, p: provRun.id || provRun.n, model: provRun.model, ok: 1, ms: elapsed, tokens: usage.totalTokens || 0 });
-        recordAiHistory({ task, provider: provRun.n, model: provRun.model, keyTail, tokens: usage.totalTokens || 0, user, sys, ok: 1, ms: elapsed, response: rawText });
-        return { ok: true as const, text: rawText };
-      } catch (e: any) {
-        const elapsed = Date.now() - t0;
-        if (p.n === "gemini") {
-          recordAiKeyAttempt(p.key, att.model, { ok: false, ms: elapsed, errMsg: e?.message || String(e), status: e?.status || 0 });
-        }
-        llog({ task, p: provRun.id || provRun.n, model: provRun.model, ok: 0, ms: elapsed, err: String(e.message || e).slice(0, 160) });
-        recordAiHistory({ task, provider: provRun.n, model: provRun.model, keyTail, user, sys, ok: 0, ms: elapsed, response: rawText, err: e.message || String(e) });
-        return { ok: false as const, err: e };
-      }
-    };
-
-    const res1 = await runAttempt(att.grounded);
-    if (res1.ok) return res1.text;
-
-    const e = res1.err;
-    last = e;
-    if (att.grounded && e.status !== 401 && e.status !== 403 && e.status !== 429 && e.status !== 404) {
-      const res2 = await runAttempt(false);
-      if (res2.ok) return res2.text;
-      last = res2.err;
-    }
-
-    if (last.authInvalid || last.status === 401 || last.status === 403 || last.status === 429 || last.status === 404 || last.status >= 500 || last.name === "AbortError" || last.networkError) {
-      coolKey(p, last, att.model);
-    }
-    await sleep(last.badJson ? 80 : 120);
-  }
   cx.calls = Math.max(0, cx.calls - 1);
   throw last || Object.assign(new Error("Все ключи ИИ недоступны или исчерпали лимит"), { status: 429, quotaExhausted: true });
 }
@@ -17244,12 +17492,14 @@ function sanitizeInterviewAnswer(rawAns: string, playerName: string): string {
   if (!ans) return safeDeflection;
   const secretsToGuard: string[] = [
     ...getGeminiKeys(),
-    ...HARDCODED.groqKeys,
+    ...HARDCODED.mistralKeys,
     ...HARDCODED.openrouterKeys,
+    String(HARDCODED.databaseUrl || ""),
     String(HARDCODED.adminCode || ""),
     String(db.settings?.adminCode || ""),
     String(process.env.ADMIN_CODE || ""),
     String(process.env.GEMINI_API_KEY || ""),
+    String(process.env.MISTRAL_API_KEY || ""),
     String(tgToken() || ""),
     ...(Array.isArray(db.teams) ? db.teams.map((t: any) => String(t?.code || "")) : [])
   ].filter((s) => s && s.length >= 4);
@@ -18100,8 +18350,13 @@ app.get("/api/admin/secrets", admin, (req, res) => {
     geminiModel: effectiveModel,
     workerUrl: workerBase(),
     hasWorkerSecret: !!HARDCODED.workerSecret,
-    hasGroq: HARDCODED.groqKeys.length > 0 || !!process.env.GROQ_API_KEY,
-    groqModel: HARDCODED.groqModel,
+    hasDatabaseUrl: !!HARDCODED.databaseUrl,
+    databaseUrlMasked: maskDatabaseUrl(HARDCODED.databaseUrl),
+    pgActive,
+    hasMistral: HARDCODED.mistralKeys.length > 0 || !!process.env.MISTRAL_API_KEY,
+    mistralModel: HARDCODED.mistralModel,
+    mistralFallbackModel: HARDCODED.mistralFallbackModel,
+    mistralActiveModel: getEffectiveMistralModel(),
     hasOpenrouter: HARDCODED.openrouterKeys.length > 0 || !!process.env.OPENROUTER_API_KEY,
     openrouterModel: HARDCODED.openrouterModel,
     hasTgToken: !!tgToken(),
@@ -21530,7 +21785,9 @@ app.get("/api/admin/overview", admin, (req, res) => {
   const fileGeminiCount = Array.isArray(sec.geminiKeys) ? sec.geminiKeys.length : (typeof sec.geminiKeys === "string" && sec.geminiKeys.trim() ? sec.geminiKeys.split(/[\n,;\s|]+/).filter(Boolean).length : 0);
   const effModels = {
     gemini: getGeminiModel(),
-    groq: HARDCODED.groqModel,
+    mistral: HARDCODED.mistralModel,
+    mistralFallback: HARDCODED.mistralFallbackModel,
+    mistralActive: getEffectiveMistralModel(),
     openrouter: HARDCODED.openrouterModel
   };
   res.json({
@@ -21550,6 +21807,9 @@ app.get("/api/admin/overview", admin, (req, res) => {
       tgChat: tgChat(),
       workerUrl: workerBase(),
       hasWorkerSecret: !!HARDCODED.workerSecret,
+      hasDatabaseUrl: !!HARDCODED.databaseUrl,
+      databaseUrlMasked: maskDatabaseUrl(HARDCODED.databaseUrl),
+      pgActive,
       appBaseUrl: String(db.settings.siteUrl || process.env.APP_URL || "").trim().replace(/\/+$/, ""),
       adminCode: process.env.ADMIN_CODE || HARDCODED.adminCode || db.settings.adminCode,
       systemPrompt: db.settings.systemPrompt || SYS_DEFAULT,
@@ -21565,7 +21825,7 @@ app.get("/api/admin/overview", admin, (req, res) => {
       geminiEnvCount: envGemini.length,
       geminiTails: activeGemini.map((k) => "\u2026" + k.slice(-4)),
       geminiCooling: activeGemini.filter((k) => isKeyBlocked(k, Date.now(), getGeminiModel())).length,
-      groq: HARDCODED.groqKeys.length > 0 || !!process.env.GROQ_API_KEY,
+      mistral: HARDCODED.mistralKeys.length > 0 || !!process.env.MISTRAL_API_KEY,
       openrouter: HARDCODED.openrouterKeys.length > 0 || !!process.env.OPENROUTER_API_KEY
     },
     models: effModels,
@@ -21675,8 +21935,16 @@ function buildAdminAiStatusPayload() {
       primary: activeModel,
       effective: getEffectiveGeminiModel(now),
       presets: GEMINI_PRESET_MODELS,
-      groq: HARDCODED.groqKeys.length || process.env.GROQ_API_KEY ? HARDCODED.groqModel : "",
+      mistral: HARDCODED.mistralKeys.length || process.env.MISTRAL_API_KEY ? getEffectiveMistralModel(now) : "",
+      mistralPrimary: HARDCODED.mistralModel,
+      mistralFallback: HARDCODED.mistralFallbackModel,
+      mistralUsingFallback: isMistralUsingFallback(now),
       openrouter: HARDCODED.openrouterKeys.length || process.env.OPENROUTER_API_KEY ? HARDCODED.openrouterModel : ""
+    },
+    database: {
+      active: pgActive,
+      configured: !!HARDCODED.databaseUrl,
+      maskedUrl: maskDatabaseUrl(HARDCODED.databaseUrl)
     },
     proxy: {
       active: !!proxyUrl,
@@ -21738,9 +22006,7 @@ app.post("/api/admin/ai/settings", admin, (req, res) => {
   if (Object.keys(secUpdates).length > 0) {
     saveSecretsFile(secUpdates);
   }
-  keyCooldown.clear();
-  modelErrorStreak.clear();
-  stickyFallbackModel = null;
+  resetAllAiFailoverState();
   save();
   if (db.settings.auto) setTimeout(runAutoStartTick, 50);
   res.json(buildAdminAiStatusPayload());
@@ -21748,15 +22014,14 @@ app.post("/api/admin/ai/settings", admin, (req, res) => {
 app.post("/api/admin/ai/reset-cooldowns", admin, (req, res) => {
   const keyId = String(req.body?.keyId || "").trim();
   if (!keyId) {
-    keyCooldown.clear();
-    modelErrorStreak.clear();
-    stickyFallbackModel = null;
+    resetAllAiFailoverState();
     if (clearStaleFixtureAiErrors()) save();
   } else {
     const match = getGeminiKeysWithMeta().find((k) => k.keyId === keyId);
     if (match) {
       clearKeyCooldown(match.key);
     }
+    geminiFailStreak = 0;
   }
   res.json(buildAdminAiStatusPayload());
 });
@@ -21817,6 +22082,17 @@ app.post("/api/admin/settings", admin, (req, res) => {
     const ws = b.workerSecret.trim();
     if (ws && !ws.includes("\u2022")) secUpdates.workerSecret = ws;
   }
+  let databaseUrlChanged = false;
+  if (b.clearDatabaseUrl) {
+    secUpdates.databaseUrl = "";
+    databaseUrlChanged = true;
+  } else if (typeof b.databaseUrl === "string") {
+    const dbu = b.databaseUrl.trim();
+    if (dbu && !dbu.includes("\u2022")) {
+      secUpdates.databaseUrl = dbu;
+      databaseUrlChanged = true;
+    }
+  }
   if (typeof b.adminCode === "string" && b.adminCode.trim() && !process.env.ADMIN_CODE) {
     s.adminCode = b.adminCode.trim();
     secUpdates.adminCode = s.adminCode;
@@ -21842,9 +22118,9 @@ app.post("/api/admin/settings", admin, (req, res) => {
     s.requireAdsgramS2S = !!b.requireAdsgramS2S;
   }
   if (typeof b.systemPrompt === "string") s.systemPrompt = b.systemPrompt.trim() === SYS_DEFAULT.trim() ? "" : b.systemPrompt;
-  const KEYF = { gemini: ["geminiKeys", "geminiKey"], groq: ["groqKeys", "groqKey"], openrouter: ["openrouterKeys", "openrouterKey"] };
-  const MODF = { gemini: "geminiModel", groq: "groqModel", openrouter: "openrouterModel" };
-  for (const k of ["gemini", "groq", "openrouter"]) {
+  const KEYF = { gemini: ["geminiKeys", "geminiKey"], mistral: ["mistralKeys", "mistralKey"], openrouter: ["openrouterKeys", "openrouterKey"] };
+  const MODF = { gemini: "geminiModel", mistral: "mistralModel", openrouter: "openrouterModel" };
+  for (const k of ["gemini", "mistral", "openrouter"]) {
     const raw = b.keys?.[k];
     const list = typeof raw === "string" ? raw.split(/[\n,;\s|]+/) : Array.isArray(raw) ? raw : null;
     if (list) {
@@ -21854,10 +22130,15 @@ app.post("/api/admin/settings", admin, (req, res) => {
     }
     if (typeof b.models?.[k] === "string") {
       const mv = b.models[k].trim();
-      secUpdates[MODF[k]] = mv ? (k === "gemini" ? resolveGeminiModel(mv) : mv) : (k === "gemini" ? DEFAULT_GEMINI_PRIMARY_MODEL : "");
+      secUpdates[MODF[k]] = mv
+        ? (k === "gemini" ? resolveGeminiModel(mv) : mv)
+        : (k === "gemini" ? DEFAULT_GEMINI_PRIMARY_MODEL : (k === "mistral" ? DEFAULT_MISTRAL_PRIMARY_MODEL : ""));
     }
   }
-  keyCooldown.clear();
+  if (typeof b.models?.mistralFallback === "string") {
+    secUpdates.mistralFallbackModel = b.models.mistralFallback.trim() || DEFAULT_MISTRAL_FALLBACK_MODEL;
+  }
+  resetAllAiFailoverState();
   if (Object.keys(secUpdates).length > 0) {
     saveSecretsFile(secUpdates);
     if (secUpdates.geminiKeys !== void 0) {
@@ -21872,6 +22153,11 @@ app.post("/api/admin/settings", admin, (req, res) => {
     secretsFile: "secrets.json",
     geminiCount: getGeminiKeys().length,
     geminiModel: getGeminiModel(),
+    mistralModel: HARDCODED.mistralModel,
+    mistralFallbackModel: HARDCODED.mistralFallbackModel,
+    hasDatabaseUrl: !!HARDCODED.databaseUrl,
+    pgActive,
+    databaseUrlChanged,
     workerUrl: workerBase(),
     hasWorkerSecret: !!HARDCODED.workerSecret
   });

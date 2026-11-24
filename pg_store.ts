@@ -21,6 +21,8 @@
      meta(key, value)                — служебное (savedAt, происхождение данных)                     */
 import pg from 'pg';
 import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
 
 /** Задайте DATABASE_URL в переменных окружения. Пусто = локальное хранение в data/db.json. */
 export const PG_HARDCODED: { url: string } = {
@@ -73,8 +75,19 @@ const DICTS: Dict[] = [
 const HANDLED = new Set<string>([...ARRAYS.map(a => a.key), ...DICTS.map(d => d.key), 'settings', 'sessions', '_savedAt', 'insiderPosts', 'eskCases', 'aiHistory']);
 
 /* ───────── подключение и схема ───────── */
+function readSecretDbUrl(): string {
+  try {
+    const f = path.resolve('secrets.json');
+    if (!fs.existsSync(f)) return '';
+    const sec = JSON.parse(fs.readFileSync(f, 'utf8'));
+    return String(sec?.databaseUrl || sec?.postgresUrl || sec?.dbUrl || '').trim();
+  } catch {
+    return '';
+  }
+}
+
 function connConfig(): pg.PoolConfig | null {
-  const raw = String(process.env.DATABASE_URL || process.env.POSTGRES_URL || PG_HARDCODED.url || '').trim();
+  const raw = String(readSecretDbUrl() || process.env.DATABASE_URL || process.env.POSTGRES_URL || PG_HARDCODED.url || '').trim();
   if (!raw) return null;
   let cs = raw;
   let ssl: any = false;
