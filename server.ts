@@ -1554,8 +1554,18 @@ function buildTeamOfMonth(month, comp, fixtures, matchesMap, teamsMap, isSeason 
 // pg_store.ts
 import pg from "pg";
 import crypto from "crypto";
-var PG_HARDCODED = { url: "" };
+var _pgHardcodedManualUrl = "";
+var PG_HARDCODED = {
+  get url() {
+    return readDbUrlFromSecrets() || _pgHardcodedManualUrl || "";
+  },
+  set url(v) {
+    _pgHardcodedManualUrl = String(v || "").trim();
+  }
+};
 var pgActive = false;
+var pgLastError = "";
+var lastAutoDbUrlAttempted = "";
 var pool = null;
 var INSTANCE_ID = crypto.randomBytes(6).toString("hex") + "_" + process.pid;
 var md5 = (s) => crypto.createHash("md5").update(s).digest("hex");
@@ -1594,25 +1604,90 @@ var DICTS = [
   { key: "cityClimates", table: "city_climates" }
 ];
 var HANDLED = /* @__PURE__ */ new Set([...ARRAYS.map((a) => a.key), ...DICTS.map((d) => d.key), "settings", "sessions", "_savedAt", "insiderPosts", "eskCases", "aiHistory"]);
-function readDbUrlFromSecrets() {
-  try {
-    const f = path3.resolve("secrets.json");
-    if (!fs3.existsSync(f)) return "";
-    const sec = JSON.parse(fs3.readFileSync(f, "utf8"));
-    return String(sec?.databaseUrl || sec?.postgresUrl || sec?.dbUrl || "").trim();
-  } catch {
-    return "";
+var DB_URL_ALIAS_KEYS = [
+  "databaseUrl",
+  "database_url",
+  "postgresUrl",
+  "postgres_url",
+  "dbUrl",
+  "db_url",
+  "pgUrl",
+  "pg_url",
+  "pgHardcodedUrl",
+  "DATABASE_URL",
+  "POSTGRES_URL",
+  "url"
+];
+function normalizeDbUrlValue(rawVal: any): string {
+  let s = String(rawVal || "").trim();
+  if (!s) return "";
+  if (/^psql\s+/i.test(s)) s = s.replace(/^psql\s+/i, "").trim();
+  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
+    s = s.slice(1, -1).trim();
   }
+  if (!s || s.includes("\u2022") || /^(MY_|YOUR_)/i.test(s)) return "";
+  return s;
+}
+function extractDbUrlFromSecObj(sec: any): string {
+  if (!sec || typeof sec !== "object") return "";
+  for (const k of DB_URL_ALIAS_KEYS) {
+    const v = normalizeDbUrlValue(sec[k]);
+    if (v) return v;
+  }
+  const pgHard = normalizeDbUrlValue(typeof sec.PG_HARDCODED === "string" ? sec.PG_HARDCODED : sec.PG_HARDCODED?.url);
+  if (pgHard) return pgHard;
+  const pgNested = normalizeDbUrlValue(sec.pg?.url);
+  if (pgNested) return pgNested;
+  return "";
+}
+function getSecretsCandidatePaths(): string[] {
+  const cwdPath = path3.resolve("secrets.json");
+  let modDirPath = cwdPath;
+  try {
+    modDirPath = path3.join(path3.dirname(fileURLToPath(import.meta.url)), "secrets.json");
+  } catch {}
+  return cwdPath === modDirPath ? [cwdPath] : [cwdPath, modDirPath];
+}
+function readDbUrlFromSecrets() {
+  for (const f of getSecretsCandidatePaths()) {
+    try {
+      if (!fs3.existsSync(f)) continue;
+      const sec = JSON.parse(fs3.readFileSync(f, "utf8"));
+      const url = extractDbUrlFromSecObj(sec);
+      if (url) return url;
+    } catch {
+    }
+  }
+  return "";
+}
+function sanitizePgError(err: any, rawUrl?: string): string {
+  let msg = String(err?.message || err || "Ошибка подключения к PostgreSQL");
+  if (rawUrl) {
+    msg = msg.split(rawUrl).join(maskDatabaseUrl(rawUrl));
+    try {
+      const u = new URL(rawUrl);
+      if (u.password) {
+        const decoded = decodeURIComponent(u.password);
+        if (decoded) msg = msg.split(decoded).join("***");
+        msg = msg.split(u.password).join("***");
+      }
+    } catch {
+    }
+  }
+  msg = msg.replace(/(postgres(?:ql)?:\/\/[^:\s]+:)([^@\s]+)(@)/gi, "$1***$3");
+  return msg.slice(0, 240);
 }
 function connConfig() {
-  const raw = String(readDbUrlFromSecrets() || process.env.DATABASE_URL || process.env.POSTGRES_URL || PG_HARDCODED.url || "").trim();
+  const raw = String(readDbUrlFromSecrets() || process.env.DATABASE_URL || process.env.POSTGRES_URL || _pgHardcodedManualUrl || "").trim();
   if (!raw) return null;
   let cs = raw;
-  let ssl = false;
+  let ssl: any = false;
   try {
     const u = new URL(raw);
     const mode = u.searchParams.get("sslmode");
-    if (mode && mode !== "disable") ssl = { rejectUnauthorized: false };
+    const host = String(u.hostname || "").toLowerCase();
+    const isManagedCloudHost = /\.(neon\.tech|supabase\.co|supabase\.com|render\.com|railway\.app|rds\.amazonaws\.com|aivencloud\.com)$/i.test(host);
+    if ((mode && mode !== "disable") || (!mode && isManagedCloudHost)) ssl = { rejectUnauthorized: false };
     u.searchParams.delete("sslmode");
     u.searchParams.delete("uselibpqcompat");
     cs = u.toString();
@@ -1620,7 +1695,7 @@ function connConfig() {
   }
   if (process.env.PGSSL === "1") ssl = { rejectUnauthorized: false };
   if (process.env.PGSSL === "0") ssl = false;
-  return { connectionString: cs, ssl, max: 5, idleTimeoutMillis: 3e4, connectionTimeoutMillis: 3e3 };
+  return { connectionString: cs, ssl, max: 5, idleTimeoutMillis: 3e4, connectionTimeoutMillis: 15e3 };
 }
 var pgConfigured = () => !!connConfig();
 async function q(text, params) {
@@ -1670,18 +1745,48 @@ async function createSchema() {
     c.release();
   }
 }
+async function pgClose() {
+  if (stateTimer) {
+    clearTimeout(stateTimer);
+    stateTimer = null;
+  }
+  if (stateRunning) {
+    try { await stateRunning; } catch {}
+  }
+  for (const t of matchTimers.values()) clearTimeout(t);
+  matchTimers.clear();
+  pendingMatches.clear();
+  lastSynced.clear();
+  syncedCodes.admin = void 0;
+  syncedCodes.clubs.clear();
+  if (pool) {
+    try { await pool.end(); } catch {}
+    pool = null;
+  }
+  pgActive = false;
+  PG_STATE = null;
+  pgCodes = null;
+}
 async function pgInit() {
   const cfg = connConfig();
   if (!cfg) {
-    pgActive = false;
+    await pgClose();
     return false;
   }
+  if (pool) await pgClose();
   pool = new pg.Pool(cfg);
   pool.on("error", (e) => console.error("PostgreSQL (\u043F\u0443\u043B):", e.message));
-  await q("SELECT 1");
-  await createSchema();
-  pgActive = true;
-  return true;
+  try {
+    await q("SELECT 1");
+    await createSchema();
+    pgActive = true;
+    return true;
+  } catch (e) {
+    try { await pool.end(); } catch {}
+    pool = null;
+    pgActive = false;
+    throw e;
+  }
 }
 var lastSynced = /* @__PURE__ */ new Map();
 function rowsOf(db2) {
@@ -5511,15 +5616,24 @@ function normalizeTgChat(raw) {
   if (!s.startsWith("@")) s = "@" + s;
   return s;
 }
-const SECRETS_FILE = path3.resolve("secrets.json");
+function resolveSecretsFilePath() {
+  for (const f of getSecretsCandidatePaths()) {
+    try {
+      if (fs3.existsSync(f)) return f;
+    } catch {}
+  }
+  return getSecretsCandidatePaths()[0];
+}
+const SECRETS_FILE = resolveSecretsFilePath();
 var lastSecretsMtimeMs = 0;
 var _secCache = { mtime: -1, data: {} };
 function readSecretsFile() {
+  const target = resolveSecretsFilePath();
   try {
-    if (fs3.existsSync(SECRETS_FILE)) {
-      const st = fs3.statSync(SECRETS_FILE);
+    if (fs3.existsSync(target)) {
+      const st = fs3.statSync(target);
       if (st.mtimeMs !== _secCache.mtime) {
-        _secCache = { mtime: st.mtimeMs, data: JSON.parse(fs3.readFileSync(SECRETS_FILE, "utf8")) };
+        _secCache = { mtime: st.mtimeMs, data: JSON.parse(fs3.readFileSync(target, "utf8")) };
       }
       return _secCache.data;
     }
@@ -5529,15 +5643,24 @@ function readSecretsFile() {
   return {};
 }
 function saveSecretsFile(updates) {
+  const target = resolveSecretsFilePath();
   try {
     const cur = readSecretsFile();
     const merged: Record<string, any> = { ...cur, ...updates };
+    if (Object.prototype.hasOwnProperty.call(updates || {}, "databaseUrl")) {
+      merged.databaseUrl = normalizeDbUrlValue(updates.databaseUrl);
+      for (const k of DB_URL_ALIAS_KEYS) {
+        if (k !== "databaseUrl") delete merged[k];
+      }
+      delete merged.PG_HARDCODED;
+      delete merged.pg;
+    }
     delete merged.groqKeys;
     delete merged.groqKey;
     delete merged.groqModel;
-    fs3.writeFileSync(SECRETS_FILE, JSON.stringify(merged, null, 2), "utf8");
+    fs3.writeFileSync(target, JSON.stringify(merged, null, 2), "utf8");
     try {
-      lastSecretsMtimeMs = fs3.statSync(SECRETS_FILE).mtimeMs;
+      lastSecretsMtimeMs = fs3.statSync(target).mtimeMs;
       _secCache = { mtime: lastSecretsMtimeMs, data: merged };
     } catch {}
     return true;
@@ -5615,7 +5738,7 @@ var HARDCODED = {
   get mistralModel() { return String(readSecretsFile().mistralModel || process.env.MISTRAL_MODEL || DEFAULT_MISTRAL_PRIMARY_MODEL).trim() || DEFAULT_MISTRAL_PRIMARY_MODEL; },
   get mistralFallbackModel() { return String(readSecretsFile().mistralFallbackModel || process.env.MISTRAL_FALLBACK_MODEL || DEFAULT_MISTRAL_FALLBACK_MODEL).trim() || DEFAULT_MISTRAL_FALLBACK_MODEL; },
   get openrouterModel() { return String(readSecretsFile().openrouterModel || process.env.OPENROUTER_MODEL || "openrouter/free").trim(); },
-  get databaseUrl() { const s = readSecretsFile(); return String(s.databaseUrl || s.postgresUrl || s.dbUrl || process.env.DATABASE_URL || process.env.POSTGRES_URL || "").trim(); },
+  get databaseUrl() { return String(readDbUrlFromSecrets() || process.env.DATABASE_URL || process.env.POSTGRES_URL || _pgHardcodedManualUrl || "").trim(); },
   get tgToken() { const t = String(readSecretsFile().tgToken || "").trim(); return t.includes("\u2022") ? "" : t; },
   get tgChat() { return String(readSecretsFile().tgChat || "").trim(); },
   get adminCode() { return readSecretsFile().adminCode || ""; },
@@ -18350,8 +18473,9 @@ app.post("/api/admin/player/discipline", admin, (req, res) => {
 });
 
 // Роут информации о секретах:
-app.get("/api/admin/secrets", admin, (req, res) => {
+app.get("/api/admin/secrets", admin, async (req, res) => {
   syncSecretsFromDisk();
+  await syncDatabaseWithSecretsIfChanged(req);
   const sec = readSecretsFile();
   const activeGemini = getGeminiKeys();
   const envGemini = getEnvGeminiKeys();
@@ -18359,7 +18483,7 @@ app.get("/api/admin/secrets", admin, (req, res) => {
   res.json({
     ok: 1,
     file: "secrets.json",
-    exists: fs3.existsSync(SECRETS_FILE),
+    exists: fs3.existsSync(resolveSecretsFilePath()),
     geminiCount: activeGemini.length,
     geminiFileCount: Array.isArray(sec.geminiKeys) ? sec.geminiKeys.length : (typeof sec.geminiKeys === "string" && sec.geminiKeys.trim() ? sec.geminiKeys.split(/[\n,;\s|]+/).filter(Boolean).length : 0),
     geminiEnvCount: envGemini.length,
@@ -18369,6 +18493,7 @@ app.get("/api/admin/secrets", admin, (req, res) => {
     hasDatabaseUrl: !!HARDCODED.databaseUrl,
     databaseUrlMasked: maskDatabaseUrl(HARDCODED.databaseUrl),
     pgActive,
+    pgError: pgLastError,
     hasMistral: HARDCODED.mistralKeys.length > 0 || !!process.env.MISTRAL_API_KEY,
     mistralModel: HARDCODED.mistralModel,
     mistralFallbackModel: HARDCODED.mistralFallbackModel,
@@ -21792,8 +21917,9 @@ app.post("/api/club/tactics/preview", needClub, (req, res) => {
   };
   res.json({ ok: 1, coach, staff, slots: slotResult.entries, fatigueWarnings, fatigueByPid, readinessSummary });
 });
-app.get("/api/admin/overview", admin, (req, res) => {
+app.get("/api/admin/overview", admin, async (req, res) => {
   syncSecretsFromDisk();
+  await syncDatabaseWithSecretsIfChanged(req);
   ensureTeamCodes();
   const sec = readSecretsFile();
   const activeGemini = getGeminiKeys();
@@ -21826,6 +21952,7 @@ app.get("/api/admin/overview", admin, (req, res) => {
       hasDatabaseUrl: !!HARDCODED.databaseUrl,
       databaseUrlMasked: maskDatabaseUrl(HARDCODED.databaseUrl),
       pgActive,
+      pgError: pgLastError,
       appBaseUrl: String(db.settings.siteUrl || process.env.APP_URL || "").trim().replace(/\/+$/, ""),
       adminCode: process.env.ADMIN_CODE || HARDCODED.adminCode || db.settings.adminCode,
       systemPrompt: db.settings.systemPrompt || SYS_DEFAULT,
@@ -21964,7 +22091,8 @@ function buildAdminAiStatusPayload() {
     database: {
       active: pgActive,
       configured: !!HARDCODED.databaseUrl,
-      maskedUrl: maskDatabaseUrl(HARDCODED.databaseUrl)
+      maskedUrl: maskDatabaseUrl(HARDCODED.databaseUrl),
+      error: pgLastError
     },
     proxy: {
       active: !!proxyUrl,
@@ -22077,7 +22205,7 @@ app.post("/api/admin/ai/test-key", admin, async (req, res) => {
   }
   res.json({ ok: 1, results, status: buildAdminAiStatusPayload() });
 });
-app.post("/api/admin/settings", admin, (req, res) => {
+app.post("/api/admin/settings", admin, async (req, res) => {
   const b = req.body || {}, s = db.settings;
   if (!s.keys) s.keys = {};
   if (!s.models) s.models = {};
@@ -22105,11 +22233,13 @@ app.post("/api/admin/settings", admin, (req, res) => {
   let databaseUrlChanged = false;
   if (b.clearDatabaseUrl) {
     secUpdates.databaseUrl = "";
+    _pgHardcodedManualUrl = "";
     databaseUrlChanged = true;
   } else if (typeof b.databaseUrl === "string") {
-    const dbu = b.databaseUrl.trim();
-    if (dbu && !dbu.includes("\u2022")) {
+    const dbu = normalizeDbUrlValue(b.databaseUrl);
+    if (dbu) {
       secUpdates.databaseUrl = dbu;
+      _pgHardcodedManualUrl = "";
       databaseUrlChanged = true;
     }
   }
@@ -22166,8 +22296,12 @@ app.post("/api/admin/settings", admin, (req, res) => {
       clearStaleFixtureAiErrors();
     }
   }
-  save();
-  if (s.auto) setTimeout(runAutoStartTick, 50);
+  if (databaseUrlChanged) {
+    await initOrReloadDatabaseStorage({ preserveToken: req.tok, preserveSession: req.sess });
+  } else {
+    save();
+  }
+  if (db.settings.auto) setTimeout(runAutoStartTick, 50);
   res.json({
     ok: 1,
     secretsFile: "secrets.json",
@@ -22176,11 +22310,18 @@ app.post("/api/admin/settings", admin, (req, res) => {
     mistralModel: HARDCODED.mistralModel,
     mistralFallbackModel: HARDCODED.mistralFallbackModel,
     hasDatabaseUrl: !!HARDCODED.databaseUrl,
+    databaseUrlMasked: maskDatabaseUrl(HARDCODED.databaseUrl),
     pgActive,
+    pgError: pgLastError,
     databaseUrlChanged,
     workerUrl: workerBase(),
     hasWorkerSecret: !!HARDCODED.workerSecret
   });
+});
+app.post("/api/admin/database/reconnect", admin, async (req, res) => {
+  syncSecretsFromDisk(true);
+  const r = await initOrReloadDatabaseStorage({ preserveToken: req.tok, preserveSession: req.sess });
+  res.json({ ok: 1, ...r });
 });
 app.post("/api/admin/telegram/test", admin, async (req, res) => {
   const token = typeof req.body?.tgToken === "string" && !req.body.tgToken.includes("\u2022") && req.body.tgToken.trim() ? req.body.tgToken.trim() : tgToken();
@@ -23479,60 +23620,103 @@ app.post("/api/admin/budget/award-prizes", admin, (req, res) => {
     message: `\u0423\u0441\u043F\u0435\u0448\u043D\u043E \u043D\u0430\u0447\u0438\u0441\u043B\u0435\u043D\u044B \u043F\u0440\u0438\u0437\u043E\u0432\u044B\u0435 \u0434\u043B\u044F ${count} \u043A\u043B\u0443\u0431\u043E\u0432 \u043D\u0430 \u0441\u0443\u043C\u043C\u0443 \u20AC${totalAwarded.toLocaleString("ru-RU")}!`
   });
 });
-{
-  const isTest = process.env.NODE_ENV === "test";
-  let usePg = !isTest && pgConfigured();
-  let pgSessions = {};
-  if (usePg) {
-    try {
-      await pgInit();
-    } catch (e) {
-      console.warn("PostgreSQL недоступен — переключаюсь на локальный файл data/db.json:", e.message);
-      pgActive = false;
-      usePg = false;
-    }
-  }
-  if (usePg) {
-    if (!await pgHasData()) {
-      console.log("PostgreSQL: \u0431\u0430\u0437\u0430 \u043F\u0443\u0441\u0442\u0430 \u2014 \u043F\u0435\u0440\u0435\u043D\u043E\u0448\u0443 \u0434\u0430\u043D\u043D\u044B\u0435 \u0438\u0437 \u043B\u043E\u043A\u0430\u043B\u044C\u043D\u044B\u0445 \u0444\u0430\u0439\u043B\u043E\u0432\u2026");
-      const legacy = await collectLegacy({ dataDir: DATA_DIR, codesFile: CODES_FILE });
-      if (legacy) {
-        const r = await pgImportAll(legacy);
-        console.log(`PostgreSQL: \u043F\u0435\u0440\u0435\u043D\u043E\u0441 \u0437\u0430\u0432\u0435\u0440\u0448\u0451\u043D (${legacy.source}). \u041C\u0430\u0442\u0447\u0435\u0439: ${r.matches}, \u043A\u043E\u0434\u043E\u0432 \u043A\u043B\u0443\u0431\u043E\u0432: ${r.codes}, \u0441\u0435\u0441\u0441\u0438\u0439: ${r.sessions}.`);
-      } else {
-        console.log("PostgreSQL: \u0441\u0442\u0430\u0440\u044B\u0445 \u0434\u0430\u043D\u043D\u044B\u0445 \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D\u043E \u2014 \u043D\u0430\u0447\u0438\u043D\u0430\u044E \u0441 \u0447\u0438\u0441\u0442\u043E\u0439 \u0431\u0430\u0437\u044B.");
+var _dbReloadInFlight: Promise<any> | null = null;
+async function initOrReloadDatabaseStorage(opts: { isBoot?: boolean; preserveToken?: string; preserveSession?: any } = {}) {
+  if (_dbReloadInFlight) return _dbReloadInFlight;
+  const run = async () => {
+    const currentUrl = HARDCODED.databaseUrl;
+    lastAutoDbUrlAttempted = currentUrl;
+    if (!opts.isBoot) {
+      if (pgActive) {
+        await pgFlush(() => db);
+      } else if (db && Array.isArray(db.teams)) {
+        saveNow();
       }
+      if (typeof mcache !== "undefined" && mcache) mcache.clear();
+      if (typeof matchMissingCache !== "undefined" && matchMissingCache) matchMissingCache.clear();
+      if (typeof matchFetchInflight !== "undefined" && matchFetchInflight) matchFetchInflight.clear();
+      await pgClose();
     }
-    if (await pgHasData()) {
-      await pgMigrateLegacyAiHistory(50);
-      PG_STATE = await pgLoadState();
-      const activeMatchIds = Array.isArray(PG_STATE?.fixtures)
-        ? PG_STATE.fixtures
-            .filter((f: any) => f && (f.status === "live" || f.status === "generating"))
-            .map((f: any) => f.id)
-            .filter(Boolean)
-        : [];
-      for (const [id, m] of await pgLoadMatchesByIds(activeMatchIds)) setMatchCache(id, m);
-      pgSessions = await pgLoadSessions();
-    }
-    pgCodes = await pgLoadCodes();
-    if (!pgCodes.admin && !Object.keys(pgCodes.clubs).length) {
+    const isTest = process.env.NODE_ENV === "test";
+    let usePg = !isTest && pgConfigured();
+    let pgSessions: Record<string, any> = {};
+    pgLastError = "";
+    if (usePg) {
       try {
-        const j = JSON.parse(fs3.readFileSync(CODES_FILE, "utf8"));
-        pgCodes = { admin: j.admin, clubs: j.clubs && typeof j.clubs === "object" ? j.clubs : {} };
-      } catch {
+        await pgInit();
+      } catch (e: any) {
+        pgLastError = sanitizePgError(e, currentUrl);
+        console.warn("PostgreSQL недоступен — переключаюсь на локальный файл data/db.json:", pgLastError);
+        await pgClose();
+        usePg = false;
       }
     }
-    console.log(`PostgreSQL: \u043F\u043E\u0434\u043A\u043B\u044E\u0447\u0435\u043D\u043E (\u043C\u0430\u0442\u0447\u0435\u0439 \u0432 \u043F\u0430\u043C\u044F\u0442\u0438: ${mcache.size}, \u043A\u043B\u0443\u0431\u043E\u0432 \u0441 \u043A\u043E\u0434\u0430\u043C\u0438: ${Object.keys(pgCodes.clubs).length}, \u0441\u0435\u0441\u0441\u0438\u0439: ${Object.keys(pgSessions).length})`);
-  } else if (!isTest) {
-    console.warn("\u26A0 PostgreSQL не используется — база хранится в файле data/db.json.");
-  }
-  load();
-  if (usePg) {
-    db.sessions = pgSessions;
-    pgSyncCodes(codeReg);
+    if (usePg) {
+      if (!await pgHasData()) {
+        console.log("PostgreSQL: \u0431\u0430\u0437\u0430 \u043F\u0443\u0441\u0442\u0430 \u2014 \u043F\u0435\u0440\u0435\u043D\u043E\u0448\u0443 \u0434\u0430\u043D\u043D\u044B\u0435 \u0438\u0437 \u043B\u043E\u043A\u0430\u043B\u044C\u043D\u044B\u0445 \u0444\u0430\u0439\u043B\u043E\u0432\u2026");
+        const legacy = await collectLegacy({ dataDir: DATA_DIR, codesFile: CODES_FILE });
+        if (legacy) {
+          const r = await pgImportAll(legacy);
+          console.log(`PostgreSQL: \u043F\u0435\u0440\u0435\u043D\u043E\u0441 \u0437\u0430\u0432\u0435\u0440\u0448\u0451\u043D (${legacy.source}). \u041C\u0430\u0442\u0447\u0435\u0439: ${r.matches}, \u043A\u043E\u0434\u043E\u0432 \u043A\u043B\u0443\u0431\u043E\u0432: ${r.codes}, \u0441\u0435\u0441\u0441\u0438\u0439: ${r.sessions}.`);
+        } else {
+          console.log("PostgreSQL: \u0441\u0442\u0430\u0440\u044B\u0445 \u0434\u0430\u043D\u043D\u044B\u0445 \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D\u043E \u2014 \u043D\u0430\u0447\u0438\u043D\u0430\u044E \u0441 \u0447\u0438\u0441\u0442\u043E\u0439 \u0431\u0430\u0437\u044B.");
+        }
+      }
+      if (await pgHasData()) {
+        await pgMigrateLegacyAiHistory(50);
+        PG_STATE = await pgLoadState();
+        const activeMatchIds = Array.isArray(PG_STATE?.fixtures)
+          ? PG_STATE.fixtures
+              .filter((f: any) => f && (f.status === "live" || f.status === "generating"))
+              .map((f: any) => f.id)
+              .filter(Boolean)
+          : [];
+        for (const [id, m] of await pgLoadMatchesByIds(activeMatchIds)) setMatchCache(id, m);
+        pgSessions = await pgLoadSessions();
+      }
+      pgCodes = await pgLoadCodes();
+      if (!pgCodes.admin && !Object.keys(pgCodes.clubs).length) {
+        try {
+          const j = JSON.parse(fs3.readFileSync(CODES_FILE, "utf8"));
+          pgCodes = { admin: j.admin, clubs: j.clubs && typeof j.clubs === "object" ? j.clubs : {} };
+        } catch {
+        }
+      }
+      console.log(`PostgreSQL: \u043F\u043E\u0434\u043A\u043B\u044E\u0447\u0435\u043D\u043E (\u043C\u0430\u0442\u0447\u0435\u0439 \u0432 \u043F\u0430\u043C\u044F\u0442\u0438: ${mcache.size}, \u043A\u043B\u0443\u0431\u043E\u0432 \u0441 \u043A\u043E\u0434\u0430\u043C\u0438: ${Object.keys(pgCodes.clubs).length}, \u0441\u0435\u0441\u0441\u0438\u0439: ${Object.keys(pgSessions).length})`);
+    } else if (!isTest) {
+      console.warn("\u26A0 PostgreSQL не используется — база хранится в файле data/db.json.");
+    }
+    load();
+    if (usePg) {
+      db.sessions = pgSessions;
+      pgSyncCodes(codeReg);
+    }
+    if (opts.preserveToken && opts.preserveSession) {
+      db.sessions = db.sessions || {};
+      db.sessions[opts.preserveToken] = opts.preserveSession;
+      if (usePg) pgSaveSession(opts.preserveToken, opts.preserveSession);
+    }
+    if (!opts.isBoot && typeof invalidateAgg === "function") invalidateAgg();
+    return {
+      pgActive,
+      pgError: pgLastError,
+      hasDatabaseUrl: !!HARDCODED.databaseUrl,
+      databaseUrlMasked: maskDatabaseUrl(HARDCODED.databaseUrl)
+    };
+  };
+  _dbReloadInFlight = run().finally(() => {
+    _dbReloadInFlight = null;
+  });
+  return _dbReloadInFlight;
+}
+async function syncDatabaseWithSecretsIfChanged(req?: any) {
+  if (process.env.NODE_ENV === "test") return;
+  const currentUrl = HARDCODED.databaseUrl;
+  if (currentUrl !== lastAutoDbUrlAttempted) {
+    await initOrReloadDatabaseStorage({ preserveToken: req?.tok, preserveSession: req?.sess });
   }
 }
+await initOrReloadDatabaseStorage({ isBoot: true });
 app.get("/api/admin/referees", admin, (req, res) => {
   reconcileRefereeStats();
   const list = [...db.referees || []].sort((a, b) => (b.rating || 0) - (a.rating || 0) || (b.matches || 0) - (a.matches || 0) || getRefereeSeedRating(b) - getRefereeSeedRating(a));

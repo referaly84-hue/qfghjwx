@@ -23,10 +23,67 @@ import pg from 'pg';
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 
-/** Задайте DATABASE_URL в переменных окружения. Пусто = локальное хранение в data/db.json. */
+const DB_URL_ALIAS_KEYS = [
+  'databaseUrl',
+  'database_url',
+  'postgresUrl',
+  'postgres_url',
+  'dbUrl',
+  'db_url',
+  'pgUrl',
+  'pg_url',
+  'pgHardcodedUrl',
+  'DATABASE_URL',
+  'POSTGRES_URL',
+  'url',
+];
+
+function normalizeDbUrlValue(rawVal: any): string {
+  let s = String(rawVal || '').trim();
+  if (!s) return '';
+  if (/^psql\s+/i.test(s)) s = s.replace(/^psql\s+/i, '').trim();
+  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
+    s = s.slice(1, -1).trim();
+  }
+  if (!s || s.includes('\u2022') || /^(MY_|YOUR_)/i.test(s)) return '';
+  return s;
+}
+
+function readSecretDbUrl(): string {
+  const candidates = [path.resolve('secrets.json')];
+  try {
+    const modDir = path.join(path.dirname(fileURLToPath(import.meta.url)), 'secrets.json');
+    if (modDir !== candidates[0]) candidates.push(modDir);
+  } catch { /* ignore */ }
+  for (const f of candidates) {
+    try {
+      if (!fs.existsSync(f)) continue;
+      const sec = JSON.parse(fs.readFileSync(f, 'utf8'));
+      if (!sec || typeof sec !== 'object') continue;
+      for (const k of DB_URL_ALIAS_KEYS) {
+        const v = normalizeDbUrlValue(sec[k]);
+        if (v) return v;
+      }
+      const pgHard = normalizeDbUrlValue(typeof sec.PG_HARDCODED === 'string' ? sec.PG_HARDCODED : sec.PG_HARDCODED?.url);
+      if (pgHard) return pgHard;
+      const pgNested = normalizeDbUrlValue(sec.pg?.url);
+      if (pgNested) return pgNested;
+    } catch { /* ignore */ }
+  }
+  return '';
+}
+
+let _pgHardcodedManualUrl = '';
+/** Читает URL из secrets.json (databaseUrl / url / pgUrl) или задаётся вручную. Пусто = локальное хранение в data/db.json. */
 export const PG_HARDCODED: { url: string } = {
-  url: '',
+  get url() {
+    return readSecretDbUrl() || _pgHardcodedManualUrl || '';
+  },
+  set url(v: string) {
+    _pgHardcodedManualUrl = String(v || '').trim();
+  },
 };
 
 export let pgActive = false;
@@ -75,26 +132,17 @@ const DICTS: Dict[] = [
 const HANDLED = new Set<string>([...ARRAYS.map(a => a.key), ...DICTS.map(d => d.key), 'settings', 'sessions', '_savedAt', 'insiderPosts', 'eskCases', 'aiHistory']);
 
 /* ───────── подключение и схема ───────── */
-function readSecretDbUrl(): string {
-  try {
-    const f = path.resolve('secrets.json');
-    if (!fs.existsSync(f)) return '';
-    const sec = JSON.parse(fs.readFileSync(f, 'utf8'));
-    return String(sec?.databaseUrl || sec?.postgresUrl || sec?.dbUrl || '').trim();
-  } catch {
-    return '';
-  }
-}
-
 function connConfig(): pg.PoolConfig | null {
-  const raw = String(readSecretDbUrl() || process.env.DATABASE_URL || process.env.POSTGRES_URL || PG_HARDCODED.url || '').trim();
+  const raw = String(readSecretDbUrl() || process.env.DATABASE_URL || process.env.POSTGRES_URL || _pgHardcodedManualUrl || '').trim();
   if (!raw) return null;
   let cs = raw;
   let ssl: any = false;
   try {
     const u = new URL(raw);
     const mode = u.searchParams.get('sslmode');
-    if (mode && mode !== 'disable') ssl = { rejectUnauthorized: false };
+    const host = String(u.hostname || '').toLowerCase();
+    const isManagedCloudHost = /\.(neon\.tech|supabase\.co|supabase\.com|render\.com|railway\.app|rds\.amazonaws\.com|aivencloud\.com)$/i.test(host);
+    if ((mode && mode !== 'disable') || (!mode && isManagedCloudHost)) ssl = { rejectUnauthorized: false };
     u.searchParams.delete('sslmode');
     u.searchParams.delete('uselibpqcompat');
     cs = u.toString();
@@ -140,13 +188,21 @@ async function createSchema() {
 /** Подключается к PostgreSQL и создаёт таблицы. false — строка подключения не задана. Если задана, но БД недоступна — бросает ошибку. */
 export async function pgInit(): Promise<boolean> {
   const cfg = connConfig();
-  if (!cfg) { pgActive = false; return false; }
+  if (!cfg) { await pgClose(); return false; }
+  if (pool) await pgClose();
   pool = new pg.Pool(cfg);
   pool.on('error', (e: any) => console.error('PostgreSQL (пул):', e.message));
-  await q('SELECT 1');
-  await createSchema();
-  pgActive = true;
-  return true;
+  try {
+    await q('SELECT 1');
+    await createSchema();
+    pgActive = true;
+    return true;
+  } catch (e) {
+    try { await pool.end(); } catch { /* ignore */ }
+    pool = null;
+    pgActive = false;
+    throw e;
+  }
 }
 
 export async function pgClose() {

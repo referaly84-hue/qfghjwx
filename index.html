@@ -16218,16 +16218,20 @@ async function pgAdmin(app) {
     <div class="panel">
       <div class="row sp" style="flex-wrap:wrap;gap:8px;margin-bottom:6px">
         <h3 style="margin:0">🗄 База данных (URL в secrets.json)</h3>
-        ${s.pgActive
-          ? '<span class="tag" style="background:#dcfce7;color:#166534;border-color:#86efac;font-weight:700">PostgreSQL активен</span>'
-          : (s.hasDatabaseUrl
-            ? '<span class="tag" style="background:#fef3c7;color:#92400e;border-color:#fde68a;font-weight:700">PostgreSQL недоступен · локальный data/db.json</span>'
-            : '<span class="tag">Локальный файл data/db.json</span>')}
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          ${s.pgActive
+            ? '<span class="tag" style="background:#dcfce7;color:#166534;border-color:#86efac;font-weight:700">PostgreSQL активен</span>'
+            : (s.hasDatabaseUrl
+              ? '<span class="tag" style="background:#fef3c7;color:#92400e;border-color:#fde68a;font-weight:700">PostgreSQL недоступен · локальный data/db.json</span>'
+              : '<span class="tag">Локальный файл data/db.json</span>')}
+          <button type="button" class="btn alt sm" id="pg_reconnect_btn">🔄 Проверить и переподключить БД</button>
+        </div>
       </div>
-      <label>PostgreSQL / Neon URL (<code>databaseUrl</code> в <code>secrets.json</code>)</label>
+      <label>PostgreSQL / Neon URL (<code>databaseUrl</code> или <code>url</code> в <code>secrets.json</code>)</label>
       <input id="s_database_url" type="password" value="" autocomplete="off" placeholder="${s.hasDatabaseUrl ? e(s.databaseUrlMasked || '••••••') + ' (задан, пусто — не менять)' : 'postgresql://user:password@host/db?sslmode=require'}">
       ${s.hasDatabaseUrl ? `<label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;margin-top:6px;font-size:12px"><input type="checkbox" id="s_clear_database_url" style="width:auto"> Очистить URL базы данных (перейти на локальный data/db.json)</label>` : ''}
-      <div class="small muted" style="margin-top:4px">Хранится локально в <code>secrets.json</code>. При изменении URL потребуется перезапуск сервера.</div>
+      ${s.pgError && !s.pgActive ? `<div style="background:#fef2f2;border:1px solid #fca5a5;color:#991b1b;padding:8px 10px;border-radius:8px;margin-top:6px;font-size:12px"><b>Ошибка PostgreSQL:</b> ${e(s.pgError)}</div>` : ''}
+      <div class="small muted" style="margin-top:4px">Хранится в <code>secrets.json</code> (ключ <code>databaseUrl</code>, также поддерживаются <code>url</code>, <code>pgUrl</code>, <code>postgresUrl</code>). Подключается сразу после сохранения без перезапуска.</div>
     </div>
     <div class="panel"><h3>Нейросеть и Cloudflare Worker</h3><p class="muted small">Цепочка резерва: Gemini (<code>${e(mo.gemini || 'gemini-4-hydrogen')}</code>, после 3 ошибок всех ключей) → Mistral AI (<code>${e(mo.mistral || 'ministral-14b-latest')}</code>, после 3 ошибок → <code>${e(mo.mistralFallback || 'ministral-8b-latest')}</code>) → OpenRouter (<code>${e(mo.openrouter || 'openrouter/free')}</code>). Подробнее во вкладке «🧠 ИИ».</p>
     ${[['gemini', 'Google Gemini (AI Studio)', 'gemini-4-hydrogen'], ['mistral', 'Mistral AI', 'ministral-14b-latest'], ['openrouter', 'OpenRouter', 'openrouter/free']].map(([n, t, d]) => `<div class="row" style="margin-top:8px;align-items:flex-start"><div style="flex:1;min-width:230px">${n === 'gemini' ? `<label>${t} ${k.geminiCount ? '<span class="tag">активных ключей: ' + k.geminiCount + (k.geminiFileCount || k.geminiEnvCount ? ` (secrets.json: ${k.geminiFileCount || 0}, env: ${k.geminiEnvCount || 0})` : '') + (k.geminiCooling ? ' (на паузе: ' + k.geminiCooling + ')' : '') + '</span>' : '<span class="tag" style="background:#fef2f2;color:#991b1b;border-color:#fca5a5">ключей нет</span>'}</label><textarea id="k_gemini" rows="5" style="font:13px/1.4 ui-monospace,Consolas,monospace" autocomplete="off" placeholder="${k.geminiCount ? 'Сейчас: ' + (k.geminiTails || []).join(', ') + '. Вставьте любые ключи (по одному в строке, без ограничений — хоть 50 штук). Пусто — не менять.' : 'Вставьте ключи Gemini, по одному в строке (неограниченно: 10, 20, 50+ штук). Будет работать балансировка Round-Robin.'}"></textarea><div class="muted small" style="margin-top:3px">✨ Поддерживается любое количество ключей Gemini (до 50+). Все ключи используют одну выбранную модель по кругу (Round-Robin).</div>` : `<label>${t} ${k[n + 'Count'] ? '<span class="tag">активных ключей: ' + k[n + 'Count'] + '</span>' : (k[n] ? '<span class="tag">ключ есть</span>' : '')}</label><textarea id="k_${n}" rows="3" style="font:13px/1.4 ui-monospace,Consolas,monospace" autocomplete="off" placeholder="${k[n + 'Count'] ? 'Сейчас: ' + (k[n + 'Tails'] || []).join(', ') + '. Вставьте ключи по одному в строке (пусто — не менять).' : 'Вставьте один или несколько ключей, по одному в строке'}"></textarea><div class="muted small" style="margin-top:3px">Можно добавить несколько ключей (по одному в строке или через запятую).</div>`}</div><div style="flex:1;min-width:200px"><label>${n === 'mistral' ? 'Основная модель Mistral' : 'Модель'}</label><input id="m_${n}" value="${e(mo[n] || '')}" placeholder="${d}">${n === 'mistral' ? `<label style="margin-top:8px">Запасная модель (после 3 ошибок)</label><input id="m_mistralFallback" value="${e(mo.mistralFallback || 'ministral-8b-latest')}" placeholder="ministral-8b-latest">` : ''}</div></div>`).join('')}
@@ -16294,6 +16298,23 @@ async function pgAdmin(app) {
       };
     }
 
+    const pgReconnectBtn = $('#pg_reconnect_btn');
+    if (pgReconnectBtn) {
+      pgReconnectBtn.onclick = async () => {
+        pgReconnectBtn.disabled = true;
+        pgReconnectBtn.textContent = 'Подключаюсь… ⏳';
+        const r = await act(() => api('/admin/database/reconnect', {}));
+        pgReconnectBtn.disabled = false;
+        pgReconnectBtn.textContent = '🔄 Проверить и переподключить БД';
+        if (r) {
+          if (r.pgActive) toast('PostgreSQL подключён и база загружена!');
+          else if (r.pgError) toast('PostgreSQL недоступен: ' + r.pgError, true);
+          else toast('URL базы не задан — используется локальный data/db.json');
+          re();
+        }
+      };
+    }
+
     $('#ssv').onclick = async () => {
       const keys = {}, models = {};
       for (const n of ['gemini', 'mistral', 'openrouter']) {
@@ -16303,7 +16324,17 @@ async function pgAdmin(app) {
       }
       if ($('#m_mistralFallback')) models.mistralFallback = $('#m_mistralFallback').value;
       const clearDbEl = $('#s_clear_database_url');
-      await act(() => api('/admin/settings', { keys, models, databaseUrl: $('#s_database_url')?.value || '', clearDatabaseUrl: !!(clearDbEl && clearDbEl.checked), workerUrl: $('#s_worker_url').value.trim(), workerSecret: $('#s_worker_secret').value, grounding: $('#gr').checked, secPerMin: $('#spm').value, breakSec: $('#brk').value, tgToken: $('#tgt').value, tgChat: $('#tgc').value, siteUrl: $('#url').value, squadMax: $('#sqm').value, chunks: $('#chk').value, auto: $('#auto').checked, techDefeat: $('#tdef').checked, systemPrompt: $('#sys').value }), 'Настройки сохранены');
+      const r = await act(() => api('/admin/settings', { keys, models, databaseUrl: $('#s_database_url')?.value || '', clearDatabaseUrl: !!(clearDbEl && clearDbEl.checked), workerUrl: $('#s_worker_url').value.trim(), workerSecret: $('#s_worker_secret').value, grounding: $('#gr').checked, secPerMin: $('#spm').value, breakSec: $('#brk').value, tgToken: $('#tgt').value, tgChat: $('#tgc').value, siteUrl: $('#url').value, squadMax: $('#sqm').value, chunks: $('#chk').value, auto: $('#auto').checked, techDefeat: $('#tdef').checked, systemPrompt: $('#sys').value }), r => {
+        if (r?.databaseUrlChanged) {
+          if (r.pgActive) return 'Настройки сохранены · PostgreSQL подключён!';
+          if (r.pgError) return 'Настройки сохранены · PostgreSQL недоступен: ' + r.pgError;
+          return 'Настройки сохранены · локальный data/db.json';
+        }
+        return 'Настройки сохранены';
+      });
+      if (r && r.databaseUrlChanged && !r.pgActive && r.pgError) {
+        toast('Ошибка PostgreSQL: ' + r.pgError, true);
+      }
       re();
     };
   }
