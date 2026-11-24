@@ -16205,13 +16205,39 @@ async function pgAdmin(app) {
   }
   else if (AT === 'settings') {
     const s = ov.settings, k = ov.keys, mo = ov.models || {};
-    ab.innerHTML = `<div class="panel" style="background:#f0fdf4;border:1px solid #86efac;margin-bottom:14px">
-      <div class="row sp" style="flex-wrap:wrap;gap:10px">
-        <div>
-          <h3 style="margin:0 0 4px;color:#166534">📁 Отдельный файл секретов: secrets.json</h3>
-          <p class="small muted" style="margin:0">Все секретные данные (URL базы данных, ключи ИИ Gemini, Mistral AI, OpenRouter, модели, Cloudflare Worker, токен Telegram-бота и ID канала) сохранены в отдельном файле <code>secrets.json</code> в корне проекта. При сохранении этой вкладки файл автоматически обновляется.</p>
+    ab.innerHTML = `<div class="panel" style="border:1px solid ${s.secretsStatus?.parseError ? '#fca5a5' : (s.secretsStatus?.empty || s.secretsStatus?.exists === false ? '#fde68a' : '#86efac')};background:${s.secretsStatus?.parseError ? '#fef2f2' : (s.secretsStatus?.empty || s.secretsStatus?.exists === false ? '#fffbeb' : '#f0fdf4')};margin-bottom:14px">
+      <div class="row sp" style="align-items:center;flex-wrap:wrap;gap:10px">
+        <div style="flex:1;min-width:240px">
+          <h3 style="margin:0 0 4px;color:${s.secretsStatus?.parseError ? '#991b1b' : (s.secretsStatus?.empty || s.secretsStatus?.exists === false ? '#92400e' : '#166534')}">📁 Отдельный файл секретов: ${e(s.secretsStatus?.location || 'secrets.json')}</h3>
+          <p class="small muted" style="margin:0">Файл <code>secrets.json</code> лежит в корне проекта рядом с <code>server.ts</code> и защищён от прямого доступа по HTTP. Не публикуйте заполненные ключи в публичный репозиторий; также можно загрузить или вставить JSON кнопками справа.</p>
+          <div class="small muted" style="margin-top:4px">Сейчас активно: БД <b>${s.pgActive ? 'PostgreSQL' : (s.hasDatabaseUrl ? 'PostgreSQL (ошибка)' : 'нет')}</b> · Gemini <b>${k.geminiCount || 0}</b> · Mistral <b>${k.mistralCount || 0}</b> · OpenRouter <b>${k.openrouterCount || 0}</b> · Worker <b>${s.workerUrl ? 'да' : 'нет'}</b> · Telegram <b>${s.hasTgToken ? 'да' : 'нет'}</b></div>
+          ${s.secretsStatus?.parseError ? `<div style="margin-top:6px;font-size:12px;color:#991b1b"><b>Ошибка JSON в файле:</b> ${e(s.secretsStatus.parseError)}</div>` : ''}
         </div>
-        <span class="tag" style="background:#dcfce7;color:#166534;border-color:#86efac;font-weight:700">secrets.json активен</span>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          ${s.secretsStatus?.parseError
+            ? '<span class="tag" style="background:#fee2e2;color:#991b1b;border-color:#fca5a5;font-weight:700">Ошибка JSON</span>'
+            : (s.secretsStatus?.exists === false
+              ? '<span class="tag" style="background:#fef3c7;color:#92400e;border-color:#fde68a;font-weight:700">Файл не найден</span>'
+              : (s.secretsStatus?.empty
+                ? '<span class="tag" style="background:#fef3c7;color:#92400e;border-color:#fde68a;font-weight:700">secrets.json пустой</span>'
+                : '<span class="tag" style="background:#dcfce7;color:#166534;border-color:#86efac;font-weight:700">secrets.json загружен</span>'))}
+          <label class="btn alt sm" id="btn_import_secrets" style="position:relative;overflow:hidden;cursor:pointer;display:inline-flex;align-items:center">📤 Загрузить secrets.json<input type="file" id="inp_import_secrets" accept=".json,application/json" style="position:absolute;inset:0;width:100%;height:100%;opacity:0;cursor:pointer"></label>
+          <button type="button" class="btn alt sm" id="btn_paste_secrets">📋 Вставить JSON</button>
+        </div>
+      </div>
+      <div id="box_paste_secrets" hidden style="margin-top:10px;padding-top:10px;border-top:1px solid rgba(0,0,0,0.08)">
+        <label style="font-size:12px">Вставьте содержимое вашего файла <code>secrets.json</code>:</label>
+        <textarea id="txt_import_secrets" rows="6" style="font:12px/1.4 ui-monospace,Consolas,monospace" placeholder='{
+  "databaseUrl": "postgresql://...",
+  "geminiKeys": ["..."],
+  "workerUrl": "https://...",
+  "tgToken": "...",
+  "tgChat": "@..."
+}'></textarea>
+        <div class="row" style="margin-top:8px;gap:8px">
+          <button type="button" class="btn sm" id="btn_apply_paste_secrets">Применить JSON в secrets.json</button>
+          <button type="button" class="btn alt sm" id="btn_cancel_paste_secrets">Отмена</button>
+        </div>
       </div>
     </div>
     <div class="panel"><h3>Код администратора</h3><div class="code">${e(s.adminCode)}</div><p class="muted small">Его можно переопределить переменной окружения ADMIN_CODE.</p></div>
@@ -16294,6 +16320,61 @@ async function pgAdmin(app) {
         if (r) {
           resBox.hidden = false;
           resBox.innerHTML = `<div class="tag" style="background:#f0fdf4;color:#166534;border:1px solid #86efac;padding:8px 12px;display:block;white-space:normal">${e(r.message)}</div>`;
+        }
+      };
+    }
+
+    const applyImportedSecretsJson = async (rawJson) => {
+      const r = await act(() => api('/admin/secrets/import', { rawJson }), res => {
+        if (res?.hasDatabaseUrl && !res?.pgActive && res?.pgError) {
+          return 'secrets.json импортирован · ошибка БД: ' + res.pgError;
+        }
+        return res?.pgActive ? 'secrets.json импортирован · PostgreSQL подключён!' : 'secrets.json успешно импортирован!';
+      });
+      if (r && r.hasDatabaseUrl && !r.pgActive && r.pgError) {
+        toast('Ошибка PostgreSQL: ' + r.pgError, true);
+      }
+      if (r) re();
+      return r;
+    };
+    const inpImportSec = $('#inp_import_secrets');
+    if (inpImportSec) {
+      inpImportSec.onchange = async () => {
+        const f = inpImportSec.files && inpImportSec.files[0];
+        if (!f) return;
+        try {
+          const rawJson = await f.text();
+          await applyImportedSecretsJson(rawJson);
+        } finally {
+          inpImportSec.value = '';
+        }
+      };
+    }
+    const btnPasteSec = $('#btn_paste_secrets');
+    const boxPasteSec = $('#box_paste_secrets');
+    const txtPasteSec = $('#txt_import_secrets');
+    const btnApplyPasteSec = $('#btn_apply_paste_secrets');
+    const btnCancelPasteSec = $('#btn_cancel_paste_secrets');
+    if (btnPasteSec && boxPasteSec) {
+      btnPasteSec.onclick = () => {
+        boxPasteSec.hidden = !boxPasteSec.hidden;
+        if (!boxPasteSec.hidden && txtPasteSec) txtPasteSec.focus();
+      };
+    }
+    if (btnCancelPasteSec && boxPasteSec) {
+      btnCancelPasteSec.onclick = () => { boxPasteSec.hidden = true; };
+    }
+    if (btnApplyPasteSec && txtPasteSec) {
+      btnApplyPasteSec.onclick = async () => {
+        const rawJson = txtPasteSec.value.trim();
+        if (!rawJson) return toast('Вставьте содержимое JSON из secrets.json', true);
+        btnApplyPasteSec.disabled = true;
+        btnApplyPasteSec.textContent = 'Применяю… ⏳';
+        try {
+          await applyImportedSecretsJson(rawJson);
+        } finally {
+          btnApplyPasteSec.disabled = false;
+          btnApplyPasteSec.textContent = 'Применить JSON в secrets.json';
         }
       };
     }

@@ -25,6 +25,14 @@ export default defineConfig(() => {
           if (fs.existsSync(distDir) && fs.existsSync(srcAssets)) {
             fs.cpSync(srcAssets, distAssets, {recursive: true, force: true});
           }
+          const distAiAssets = path.join(distDir, 'assets', 'aistudio');
+          if (fs.existsSync(distAiAssets)) {
+            for (const f of fs.readdirSync(distAiAssets)) {
+              if (/^secrets.*\.json$/i.test(f)) {
+                fs.rmSync(path.join(distAiAssets, f), {force: true});
+              }
+            }
+          }
         },
       },
     ],

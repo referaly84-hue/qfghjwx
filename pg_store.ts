@@ -52,15 +52,24 @@ function normalizeDbUrlValue(rawVal: any): string {
 }
 
 function readSecretDbUrl(): string {
-  const candidates = [path.resolve('secrets.json')];
+  const candidates: string[] = [];
+  const push = (p: string) => { if (p && !candidates.includes(p)) candidates.push(p); };
+  if (process.env.SECRETS_FILE) push(path.resolve(process.env.SECRETS_FILE));
+  push(path.resolve('secrets.json'));
   try {
-    const modDir = path.join(path.dirname(fileURLToPath(import.meta.url)), 'secrets.json');
-    if (modDir !== candidates[0]) candidates.push(modDir);
-  } catch { /* ignore */ }
+    const modDir = path.dirname(fileURLToPath(import.meta.url));
+    push(path.join(modDir, 'secrets.json'));
+    push(path.resolve('data', 'secrets.json'));
+    push(path.join(modDir, 'data', 'secrets.json'));
+  } catch {
+    push(path.resolve('data', 'secrets.json'));
+  }
+  push('/etc/secrets/secrets.json');
+  push('/run/secrets/secrets.json');
   for (const f of candidates) {
     try {
       if (!fs.existsSync(f)) continue;
-      const sec = JSON.parse(fs.readFileSync(f, 'utf8'));
+      const sec = JSON.parse(fs.readFileSync(f, 'utf8').replace(/^\uFEFF/, ''));
       if (!sec || typeof sec !== 'object') continue;
       for (const k of DB_URL_ALIAS_KEYS) {
         const v = normalizeDbUrlValue(sec[k]);
@@ -70,6 +79,17 @@ function readSecretDbUrl(): string {
       if (pgHard) return pgHard;
       const pgNested = normalizeDbUrlValue(sec.pg?.url);
       if (pgNested) return pgNested;
+    } catch { /* ignore */ }
+  }
+  if (process.env.SECRETS_JSON) {
+    try {
+      const sec = JSON.parse(String(process.env.SECRETS_JSON).replace(/^\uFEFF/, ''));
+      if (sec && typeof sec === 'object') {
+        for (const k of DB_URL_ALIAS_KEYS) {
+          const v = normalizeDbUrlValue(sec[k]);
+          if (v) return v;
+        }
+      }
     } catch { /* ignore */ }
   }
   return '';

@@ -1641,18 +1641,38 @@ function extractDbUrlFromSecObj(sec: any): string {
   return "";
 }
 function getSecretsCandidatePaths(): string[] {
-  const cwdPath = path3.resolve("secrets.json");
-  let modDirPath = cwdPath;
+  const candidates: string[] = [];
+  const pushUnique = (p: string) => {
+    if (p && !candidates.includes(p)) candidates.push(p);
+  };
+  if (process.env.SECRETS_FILE) pushUnique(path3.resolve(process.env.SECRETS_FILE));
+  pushUnique(path3.resolve("secrets.json"));
   try {
-    modDirPath = path3.join(path3.dirname(fileURLToPath(import.meta.url)), "secrets.json");
-  } catch {}
-  return cwdPath === modDirPath ? [cwdPath] : [cwdPath, modDirPath];
+    const modDir = path3.dirname(fileURLToPath(import.meta.url));
+    pushUnique(path3.join(modDir, "secrets.json"));
+    pushUnique(path3.resolve("data", "secrets.json"));
+    pushUnique(path3.join(modDir, "data", "secrets.json"));
+  } catch {
+    pushUnique(path3.resolve("data", "secrets.json"));
+  }
+  pushUnique("/etc/secrets/secrets.json");
+  pushUnique("/run/secrets/secrets.json");
+  return candidates;
 }
 function readDbUrlFromSecrets() {
   for (const f of getSecretsCandidatePaths()) {
     try {
       if (!fs3.existsSync(f)) continue;
-      const sec = JSON.parse(fs3.readFileSync(f, "utf8"));
+      const raw = fs3.readFileSync(f, "utf8").replace(/^\uFEFF/, "");
+      const sec = JSON.parse(raw);
+      const url = extractDbUrlFromSecObj(sec);
+      if (url) return url;
+    } catch {
+    }
+  }
+  if (process.env.SECRETS_JSON) {
+    try {
+      const sec = JSON.parse(String(process.env.SECRETS_JSON).replace(/^\uFEFF/, ""));
       const url = extractDbUrlFromSecObj(sec);
       if (url) return url;
     } catch {
@@ -5616,35 +5636,106 @@ function normalizeTgChat(raw) {
   if (!s.startsWith("@")) s = "@" + s;
   return s;
 }
+function hasPopulatedSecretsObj(sec: any): boolean {
+  if (!sec || typeof sec !== "object") return false;
+  if (extractDbUrlFromSecObj(sec)) return true;
+  if (secList(sec.geminiKeys, sec.geminiKey, sec.mistralKeys, sec.mistralKey, sec.openrouterKeys, sec.openrouterKey).length > 0) return true;
+  if (String(sec.tgToken || "").trim() || String(sec.tgChat || "").trim()) return true;
+  if (String(sec.workerUrl || "").trim() || String(sec.workerSecret || "").trim()) return true;
+  if (String(sec.adminCode || "").trim()) return true;
+  return false;
+}
 function resolveSecretsFilePath() {
+  let firstExisting = "";
   for (const f of getSecretsCandidatePaths()) {
+    try {
+      if (!fs3.existsSync(f)) continue;
+      if (!firstExisting) firstExisting = f;
+      const parsed = JSON.parse(fs3.readFileSync(f, "utf8").replace(/^\uFEFF/, ""));
+      if (hasPopulatedSecretsObj(parsed)) return f;
+    } catch {
+      if (!firstExisting) firstExisting = f;
+    }
+  }
+  return firstExisting || getSecretsCandidatePaths()[0];
+}
+function resolveWritableSecretsFilePath() {
+  for (const f of getSecretsCandidatePaths()) {
+    if (f.startsWith("/etc/secrets/") || f.startsWith("/run/secrets/")) continue;
     try {
       if (fs3.existsSync(f)) return f;
     } catch {}
   }
-  return getSecretsCandidatePaths()[0];
+  return path3.resolve("secrets.json");
 }
 const SECRETS_FILE = resolveSecretsFilePath();
-var lastSecretsMtimeMs = 0;
-var _secCache = { mtime: -1, data: {} };
+var lastSecretsStamp = "";
+var lastSecretsParseError = "";
+var _secCache = { path: "", stamp: "", data: {} };
+function readSecretsFromEnvJson(): any | null {
+  const rawEnv = String(process.env.SECRETS_JSON || "").trim();
+  if (!rawEnv) return null;
+  try {
+    const parsed = JSON.parse(rawEnv.replace(/^\uFEFF/, ""));
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+  } catch (e: any) {
+    lastSecretsParseError = "SECRETS_JSON: " + String(e?.message || e).slice(0, 140);
+  }
+  return null;
+}
 function readSecretsFile() {
   const target = resolveSecretsFilePath();
   try {
     if (fs3.existsSync(target)) {
       const st = fs3.statSync(target);
-      if (st.mtimeMs !== _secCache.mtime) {
-        _secCache = { mtime: st.mtimeMs, data: JSON.parse(fs3.readFileSync(target, "utf8")) };
+      const stamp = `${st.mtimeMs}:${st.size}`;
+      if (stamp !== _secCache.stamp || target !== _secCache.path) {
+        const raw = fs3.readFileSync(target, "utf8").replace(/^\uFEFF/, "");
+        const parsed = JSON.parse(raw);
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+          throw new Error("secrets.json должен содержать JSON-объект");
+        }
+        lastSecretsParseError = "";
+        _secCache = { path: target, stamp, data: parsed };
       }
+      if (hasPopulatedSecretsObj(_secCache.data)) return _secCache.data;
+      const envSec = readSecretsFromEnvJson();
+      if (envSec) return { ..._secCache.data, ...envSec };
       return _secCache.data;
     }
-  } catch (e) {
-    console.warn("[Secrets] Ошибка чтения secrets.json:", e.message);
+    lastSecretsParseError = "";
+  } catch (e: any) {
+    lastSecretsParseError = String(e?.message || e).slice(0, 180);
+    console.warn("[Secrets] Ошибка чтения secrets.json:", lastSecretsParseError);
   }
+  const envSec = readSecretsFromEnvJson();
+  if (envSec) return envSec;
   return {};
 }
-function saveSecretsFile(updates) {
+function getSecretsStatus() {
   const target = resolveSecretsFilePath();
+  const fileExists = fs3.existsSync(target);
+  const envSec = readSecretsFromEnvJson();
+  const sec = readSecretsFile();
+  const exists = fileExists || !!envSec;
+  const populated = exists && !lastSecretsParseError && hasPopulatedSecretsObj(sec);
+  let location = "secrets.json";
+  if (!fileExists && envSec) location = "env:SECRETS_JSON";
+  else if (target.startsWith("/etc/secrets/")) location = "/etc/secrets/secrets.json";
+  else if (target.startsWith("/run/secrets/")) location = "/run/secrets/secrets.json";
+  else if (target.includes(`${path3.sep}data${path3.sep}`)) location = "data/secrets.json";
+  return {
+    exists,
+    empty: exists && !lastSecretsParseError && !populated,
+    parseError: lastSecretsParseError,
+    location
+  };
+}
+function saveSecretsFile(updates) {
+  const target = resolveWritableSecretsFilePath();
   try {
+    const dir = path3.dirname(target);
+    if (dir && !fs3.existsSync(dir)) fs3.mkdirSync(dir, { recursive: true });
     const cur = readSecretsFile();
     const merged: Record<string, any> = { ...cur, ...updates };
     if (Object.prototype.hasOwnProperty.call(updates || {}, "databaseUrl")) {
@@ -5660,8 +5751,10 @@ function saveSecretsFile(updates) {
     delete merged.groqModel;
     fs3.writeFileSync(target, JSON.stringify(merged, null, 2), "utf8");
     try {
-      lastSecretsMtimeMs = fs3.statSync(target).mtimeMs;
-      _secCache = { mtime: lastSecretsMtimeMs, data: merged };
+      const st = fs3.statSync(target);
+      lastSecretsStamp = `${st.mtimeMs}:${st.size}`;
+      lastSecretsParseError = "";
+      _secCache = { path: target, stamp: lastSecretsStamp, data: merged };
     } catch {}
     return true;
   } catch (e) {
@@ -5695,10 +5788,12 @@ function maskDatabaseUrl(rawUrl: string): string {
 }
 function syncSecretsFromDisk(force = false) {
   try {
-    if (!fs3.existsSync(SECRETS_FILE)) return false;
-    const st = fs3.statSync(SECRETS_FILE);
-    if (!force && st.mtimeMs === lastSecretsMtimeMs) return false;
-    lastSecretsMtimeMs = st.mtimeMs;
+    const target = resolveSecretsFilePath();
+    if (!fs3.existsSync(target)) return false;
+    const st = fs3.statSync(target);
+    const stamp = `${st.mtimeMs}:${st.size}`;
+    if (!force && stamp === lastSecretsStamp) return false;
+    lastSecretsStamp = stamp;
     const sec = readSecretsFile();
     if (typeof resetAllAiFailoverState === "function") resetAllAiFailoverState();
     else if (typeof keyCooldown !== "undefined" && keyCooldown) keyCooldown.clear();
@@ -16742,6 +16837,12 @@ function getSeasonRotationPreview() {
   };
 }
 var app = express();
+app.use((req, res, next) => {
+  if (/(?:^|\/)secrets[^/]*\.json$/i.test(req.path)) {
+    return res.status(403).send("Forbidden");
+  }
+  next();
+});
 app.use(express.json({ limit: "5mb" }));
 app.set("etag", false);
 app.use("/api", (req, res, next) => {
@@ -18477,13 +18578,15 @@ app.get("/api/admin/secrets", admin, async (req, res) => {
   syncSecretsFromDisk();
   await syncDatabaseWithSecretsIfChanged(req);
   const sec = readSecretsFile();
+  const secStatus = getSecretsStatus();
   const activeGemini = getGeminiKeys();
   const envGemini = getEnvGeminiKeys();
   const effectiveModel = HARDCODED.geminiModel;
   res.json({
     ok: 1,
-    file: "secrets.json",
-    exists: fs3.existsSync(resolveSecretsFilePath()),
+    file: secStatus.location,
+    exists: secStatus.exists,
+    secretsStatus: secStatus,
     geminiCount: activeGemini.length,
     geminiFileCount: Array.isArray(sec.geminiKeys) ? sec.geminiKeys.length : (typeof sec.geminiKeys === "string" && sec.geminiKeys.trim() ? sec.geminiKeys.split(/[\n,;\s|]+/).filter(Boolean).length : 0),
     geminiEnvCount: envGemini.length,
@@ -18503,6 +18606,89 @@ app.get("/api/admin/secrets", admin, async (req, res) => {
     hasTgToken: !!tgToken(),
     tgChat: tgChat(),
     hasAdminCode: !!(process.env.ADMIN_CODE || sec.adminCode || db.settings?.adminCode)
+  });
+});
+app.post("/api/admin/secrets/import", admin, async (req, res) => {
+  let obj: any = null;
+  if (typeof req.body?.rawJson === "string") {
+    try {
+      obj = JSON.parse(req.body.rawJson.replace(/^\uFEFF/, ""));
+    } catch (e: any) {
+      return fail(res, "Некорректный JSON в файле secrets.json: " + String(e?.message || e));
+    }
+  } else if (req.body?.data && typeof req.body.data === "object") {
+    obj = req.body.data;
+  }
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) {
+    return fail(res, "Файл secrets.json должен содержать JSON-объект");
+  }
+  const updates: Record<string, any> = {};
+  const dbUrl = extractDbUrlFromSecObj(obj);
+  if (dbUrl) {
+    updates.databaseUrl = dbUrl;
+    _pgHardcodedManualUrl = "";
+  }
+  const gKeys = secList(obj.geminiKeys, obj.geminiKey);
+  if (gKeys.length || Array.isArray(obj.geminiKeys)) {
+    updates.geminiKeys = gKeys;
+    updates.geminiKey = "";
+  }
+  const mKeys = secList(obj.mistralKeys, obj.mistralKey);
+  if (mKeys.length || Array.isArray(obj.mistralKeys)) {
+    updates.mistralKeys = mKeys;
+    updates.mistralKey = "";
+  }
+  const oKeys = secList(obj.openrouterKeys, obj.openrouterKey);
+  if (oKeys.length || Array.isArray(obj.openrouterKeys)) {
+    updates.openrouterKeys = oKeys;
+    updates.openrouterKey = "";
+  }
+  if (typeof obj.geminiModel === "string" && obj.geminiModel.trim()) updates.geminiModel = resolveGeminiModel(obj.geminiModel.trim());
+  if (typeof obj.mistralModel === "string" && obj.mistralModel.trim()) updates.mistralModel = obj.mistralModel.trim();
+  if (typeof obj.mistralFallbackModel === "string" && obj.mistralFallbackModel.trim()) updates.mistralFallbackModel = obj.mistralFallbackModel.trim();
+  if (typeof obj.openrouterModel === "string" && obj.openrouterModel.trim()) updates.openrouterModel = obj.openrouterModel.trim();
+  if (typeof obj.workerUrl === "string") updates.workerUrl = normalizeWorkerUrl(obj.workerUrl);
+  if (typeof obj.workerSecret === "string" && !obj.workerSecret.includes("\u2022")) updates.workerSecret = obj.workerSecret.trim();
+  if (typeof obj.tgToken === "string" && !obj.tgToken.includes("\u2022")) {
+    updates.tgToken = obj.tgToken.trim();
+    tgCooldownUntil = 0;
+    tgLastStatus = { ok: true };
+  }
+  if (typeof obj.tgChat === "string") {
+    updates.tgChat = normalizeTgChat(obj.tgChat);
+    tgCooldownUntil = 0;
+    tgLastStatus = { ok: true };
+  }
+  if (typeof obj.adminCode === "string" && obj.adminCode.trim() && !process.env.ADMIN_CODE) {
+    updates.adminCode = obj.adminCode.trim();
+    db.settings.adminCode = updates.adminCode;
+    codeReg.admin = updates.adminCode;
+    saveCodeRegistry();
+  }
+  if (!saveSecretsFile(updates)) {
+    return fail(res, "Не удалось сохранить secrets.json на диск");
+  }
+  syncSecretsFromDisk(true);
+  resetAllAiFailoverState();
+  db.settings.lastAuthFailedKeyIds = [];
+  clearStaleFixtureAiErrors();
+  if (dbUrl) {
+    await initOrReloadDatabaseStorage({ preserveToken: req.tok, preserveSession: req.sess });
+  } else {
+    save();
+  }
+  res.json({
+    ok: 1,
+    secretsStatus: getSecretsStatus(),
+    pgActive,
+    pgError: pgLastError,
+    hasDatabaseUrl: !!HARDCODED.databaseUrl,
+    databaseUrlMasked: maskDatabaseUrl(HARDCODED.databaseUrl),
+    geminiCount: getGeminiKeys().length,
+    mistralCount: HARDCODED.mistralKeys.length,
+    openrouterCount: HARDCODED.openrouterKeys.length,
+    hasTgToken: !!tgToken(),
+    workerUrl: workerBase()
   });
 });
 app.post("/api/admin/draw/clear-groups", admin, (req, res) => {
@@ -21953,6 +22139,7 @@ app.get("/api/admin/overview", admin, async (req, res) => {
       databaseUrlMasked: maskDatabaseUrl(HARDCODED.databaseUrl),
       pgActive,
       pgError: pgLastError,
+      secretsStatus: getSecretsStatus(),
       appBaseUrl: String(db.settings.siteUrl || process.env.APP_URL || "").trim().replace(/\/+$/, ""),
       adminCode: process.env.ADMIN_CODE || HARDCODED.adminCode || db.settings.adminCode,
       systemPrompt: db.settings.systemPrompt || SYS_DEFAULT,
@@ -27364,6 +27551,8 @@ async function startServer() {
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`\u0412\u0438\u0440\u0442 \u0420\u041F\u041B \u0437\u0430\u043F\u0443\u0449\u0435\u043D: http://localhost:${PORT}`);
     console.log(`\u041A\u043E\u0434 \u0430\u0434\u043C\u0438\u043D\u0438\u0441\u0442\u0440\u0430\u0442\u043E\u0440\u0430: ${process.env.ADMIN_CODE || db.settings.adminCode}`);
+    const secSt = getSecretsStatus();
+    console.log(`[Secrets] ${secSt.location}: ${!secSt.exists ? "файл не найден (проверены ./secrets.json, data/secrets.json, /etc/secrets/secrets.json, env SECRETS_JSON)" : secSt.parseError ? "ошибка JSON (" + secSt.parseError + ")" : secSt.empty ? "файл найден, но поля пустые" : "загружен"} | БД: ${pgActive ? "PostgreSQL" : HARDCODED.databaseUrl ? "PostgreSQL (недоступен)" : "data/db.json"}`);
     const activeProvs = provList();
     if (!activeProvs.length) {
       console.log("\u041A\u043B\u044E\u0447\u0435\u0439 \u043D\u0435\u0439\u0440\u043E\u0441\u0435\u0442\u0438 \u043D\u0435\u0442 \u2014 \u0441\u0438\u043C\u0443\u043B\u044F\u0446\u0438\u044F \u0440\u0430\u0431\u043E\u0442\u0430\u0435\u0442 \u043D\u0430 \u0437\u0430\u043F\u0430\u0441\u043D\u043E\u043C \u0433\u0435\u043D\u0435\u0440\u0430\u0442\u043E\u0440\u0435. \u0414\u043E\u0431\u0430\u0432\u044C\u0442\u0435 \u043A\u043B\u044E\u0447 \u0432 \u043D\u0430\u0441\u0442\u0440\u043E\u0439\u043A\u0430\u0445 \u0430\u0434\u043C\u0438\u043D\u043A\u0438 \u0438\u043B\u0438 \u0447\u0435\u0440\u0435\u0437 \u043F\u0435\u0440\u0435\u043C\u0435\u043D\u043D\u044B\u0435 \u043E\u043A\u0440\u0443\u0436\u0435\u043D\u0438\u044F.");
