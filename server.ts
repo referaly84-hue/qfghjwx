@@ -9784,43 +9784,59 @@ async function llm(sys, user, { json = true, task = "", temp = 0.9, max = 16e3, 
   let hadAnyAttempt = false;
   const cooledFallback: Array<{ p: any; model: string; grounded: boolean; until: number }> = [];
 
-  // ───────── ЭТАП 1: GEMINI (до 3 ошибок по всем ключам → затем Mistral) ─────────
+  // ───────── ЭТАП 1: GEMINI (проверка моделей цепочки до 3 ошибок по ключам → затем Mistral) ─────────
   if (gProvs.length && !isGeminiCircuitOpen(now)) {
-    const geminiAttempts: Array<{ p: any; model: string; grounded: boolean }> = [];
     for (const modelCandidate of modelChain) {
       for (const p of gProvs) {
         const kc = getCooldownEntry(p.key, modelCandidate, now);
-        if (kc) {
-          if (!kc.authInvalid && !kc.daily && !kc.notFound) {
-            cooledFallback.push({ p, model: modelCandidate, grounded: !!grounded, until: getCooldownUntil(kc) });
-          }
-          continue;
+        if (kc && !kc.authInvalid && !kc.daily && !kc.notFound) {
+          cooledFallback.push({ p, model: modelCandidate, grounded: !!grounded, until: getCooldownUntil(kc) });
         }
-        geminiAttempts.push({ p, model: modelCandidate, grounded: !!grounded });
       }
     }
 
     let geminiErrorsInCall = 0;
-    for (const att of geminiAttempts) {
-      if (geminiErrorsInCall >= 3 || isGeminiCircuitOpen(Date.now())) break;
-      if (getCooldownEntry(att.p.key, att.model)) continue;
+    let modelIdx = 0;
+    let sameModelErrs = 0;
+    let keyCursor = 0;
+    while (geminiErrorsInCall < 3 && !isGeminiCircuitOpen(Date.now()) && modelIdx < modelChain.length) {
+      const modelCandidate = modelChain[modelIdx];
+      let picked: any = null;
+      for (let step = 0; step < gProvs.length; step++) {
+        const cand = gProvs[(keyCursor + step) % gProvs.length];
+        if (!getCooldownEntry(cand.key, modelCandidate, Date.now())) {
+          picked = cand;
+          keyCursor = (keyCursor + step + 1) % gProvs.length;
+          break;
+        }
+      }
+      if (!picked) {
+        modelIdx++;
+        sameModelErrs = 0;
+        continue;
+      }
 
       hadAnyAttempt = true;
-      const res1 = await runProviderAttempt(att.p, att.model, att.grounded);
+      const res1 = await runProviderAttempt(picked, modelCandidate, !!grounded);
       if (res1.ok) return res1.text;
 
       let errObj = res1.err;
-      if (att.grounded && errObj.status !== 401 && errObj.status !== 403 && errObj.status !== 429 && errObj.status !== 404) {
-        const res2 = await runProviderAttempt(att.p, att.model, false);
+      if (grounded && errObj.status !== 401 && errObj.status !== 403 && errObj.status !== 429 && errObj.status !== 404) {
+        const res2 = await runProviderAttempt(picked, modelCandidate, false);
         if (res2.ok) return res2.text;
         errObj = res2.err;
       }
 
       last = errObj;
       geminiErrorsInCall++;
+      sameModelErrs++;
       recordGeminiFailure();
       if (errObj.authInvalid || errObj.status === 401 || errObj.status === 403 || errObj.status === 429 || errObj.status === 404 || errObj.status >= 500 || errObj.name === "AbortError" || errObj.networkError) {
-        coolKey(att.p, errObj, att.model);
+        coolKey(picked, errObj, modelCandidate);
+      }
+      if (sameModelErrs >= 2) {
+        modelIdx++;
+        sameModelErrs = 0;
       }
       if (geminiErrorsInCall < 3 && !isGeminiCircuitOpen(Date.now())) {
         await sleep(errObj.badJson ? 80 : 120);
@@ -21826,7 +21842,11 @@ app.get("/api/admin/overview", admin, (req, res) => {
       geminiTails: activeGemini.map((k) => "\u2026" + k.slice(-4)),
       geminiCooling: activeGemini.filter((k) => isKeyBlocked(k, Date.now(), getGeminiModel())).length,
       mistral: HARDCODED.mistralKeys.length > 0 || !!process.env.MISTRAL_API_KEY,
-      openrouter: HARDCODED.openrouterKeys.length > 0 || !!process.env.OPENROUTER_API_KEY
+      mistralCount: secList(HARDCODED.mistralKeys, process.env.MISTRAL_API_KEY).length,
+      mistralTails: secList(HARDCODED.mistralKeys, process.env.MISTRAL_API_KEY).map((k) => "\u2026" + k.slice(-4)),
+      openrouter: HARDCODED.openrouterKeys.length > 0 || !!process.env.OPENROUTER_API_KEY,
+      openrouterCount: secList(HARDCODED.openrouterKeys, process.env.OPENROUTER_API_KEY).length,
+      openrouterTails: secList(HARDCODED.openrouterKeys, process.env.OPENROUTER_API_KEY).map((k) => "\u2026" + k.slice(-4))
     },
     models: effModels,
     log: db.llmlog.slice(-25).reverse(),
